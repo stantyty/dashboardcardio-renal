@@ -1,0 +1,154 @@
+-- Define diagnosis code lists
+WITH ASCVD_CODE AS (SELECT 'code1' AS code UNION ALL SELECT 'code2' UNION ALL SELECT 'code3'),
+     CKD_CODE AS (SELECT 'code4' AS code UNION ALL SELECT 'code5'),
+     CKD_3_4_CODE AS (SELECT 'code6' AS code UNION ALL SELECT 'code7'),
+     AMI_T1_CODE AS (SELECT 'code8' AS code UNION ALL SELECT 'code9'),
+     MI_CODE AS (SELECT 'code10' AS code UNION ALL SELECT 'code11'),
+     HFpEF_CODE AS (SELECT 'code12' AS code UNION ALL SELECT 'code13'),
+
+-- Combine all diagnosis codes into a single list for filtering
+ALL_CODES AS (
+    SELECT code FROM ASCVD_CODE
+    UNION
+    SELECT code FROM CKD_CODE
+    UNION
+    SELECT code FROM CKD_3_4_CODE
+    UNION
+    SELECT code FROM AMI_T1_CODE
+    UNION
+    SELECT code FROM MI_CODE
+    UNION
+    SELECT code FROM HFpEF_CODE
+),
+
+-- Filter relevant diagnoses to reduce data volume
+relevant_diagnoses AS (
+    SELECT
+        patient_id,
+        diagnosis_code,
+        SERVICE_DATE
+    FROM
+        PTAB_F_LAAD_CONSOLIDATED_DX
+    WHERE
+        diagnosis_code IN (SELECT code FROM ALL_CODES)
+),
+
+-- Extract patient demographics (age and gender)
+patient_demographics AS (
+    SELECT
+        patient_id,
+        MIN(PATIENT_BIRTH_YEAR) AS PATIENT_BIRTH_YEAR,
+        MAX(PATIENT_GENDER) AS PATIENT_GENDER
+    FROM
+        PTAB_F_LAAD_CONSOLIDATED_DX
+    GROUP BY
+        patient_id
+),
+
+-- Create diagnosis flags per patient for all time and current 12 months
+diagnosis_flags AS (
+    SELECT
+        rd.patient_id,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM ASCVD_CODE) THEN 1 ELSE 0 END) AS ascvd_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_CODE) THEN 1 ELSE 0 END) AS ckd_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_3_4_CODE) THEN 1 ELSE 0 END) AS ckd3_4_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM AMI_T1_CODE) THEN 1 ELSE 0 END) AS ami_t1_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM MI_CODE) THEN 1 ELSE 0 END) AS mi_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM HFpEF_CODE) THEN 1 ELSE 0 END) AS HFpEF_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM ASCVD_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ascvd_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ckd_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_3_4_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ckd3_4_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM AMI_T1_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ami_t1_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM MI_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS mi_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM HFpEF_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS HFpEF_current
+    FROM
+        relevant_diagnoses rd
+    GROUP BY
+        rd.patient_id
+),
+
+-- Combine diagnosis flags with demographics
+patient_master_data AS (
+    SELECT
+        d.patient_id,
+        pd.PATIENT_BIRTH_YEAR,
+        2024 - pd.PATIENT_BIRTH_YEAR AS age,
+        pd.PATIENT_GENDER,
+        s."Access To Medication Score 1" AS access_to_medication,
+        s."Food Insecurity Score 1" AS food_insecurity,
+        s."Access To Care Score 1" AS access_to_care,
+        s."Housing Instability Score 1" AS housing_instability,
+        s."Sdoh Total 1" AS total_risk,
+        s.ethnic_ind AS ethnicity,
+        s.EDUC_ind AS education,
+        d.ascvd_all_time,
+        d.ckd_all_time,
+        d.ckd3_4_all_time,
+        d.ami_t1_all_time,
+        d.mi_all_time,
+        d.HFpEF_all_time,
+        d.ascvd_current,
+        d.ckd_current,
+        d.ckd3_4_current,
+        d.ami_t1_current,
+        d.mi_current,
+        d.HFpEF_current
+    FROM
+        diagnosis_flags d
+        LEFT JOIN patient_demographics pd ON d.patient_id = pd.patient_id
+        LEFT JOIN S_LAAD_CONS_PATIENT_DEMOGRAPHICS_EXP s ON d.patient_id = s.patient_id
+)
+
+-- Generate final master data table with two rows per patient
+SELECT
+    'ALL TIME' AS time_period,
+    pmd.patient_id,
+    pmd.age,
+    pmd.PATIENT_GENDER,
+    pmd.access_to_medication,
+    pmd.food_insecurity,
+    pmd.access_to_care,
+    pmd.housing_instability,
+    pmd.total_risk,
+    pmd.ethnicity,
+    pmd.education,
+    pmd.ascvd_all_time AS ascvd,
+    pmd.ckd_all_time AS ckd,
+    pmd.ckd3_4_all_time AS ckd3_4,
+    pmd.ami_t1_all_time AS ami_t1,
+    pmd.mi_all_time AS mi,
+    pmd.HFpEF_all_time AS HFpEF,
+    CASE WHEN pmd.ascvd_all_time = 1 AND pmd.ckd3_4_all_time = 1 THEN 1 ELSE 0 END AS Z_flag,
+    CASE WHEN pmd.HFpEF_all_time = 1 THEN 1 ELSE 0 END AS H_flag,
+    CASE WHEN pmd.ami_t1_all_time = 1 THEN 1 ELSE 0 END AS A_flag
+FROM
+    patient_master_data pmd
+
+UNION ALL
+
+SELECT
+    'CURRENT(12MONTH)' AS time_period,
+    pmd.patient_id,
+    pmd.age,
+    pmd.PATIENT_GENDER,
+    pmd.access_to_medication,
+    pmd.food_insecurity,
+    pmd.access_to_care,
+    pmd.housing_instability,
+    pmd.total_risk,
+    pmd.ethnicity,
+    pmd.education,
+    pmd.ascvd_current AS ascvd,
+    pmd.ckd_current AS ckd,
+    pmd.ckd3_4_current AS ckd3_4,
+    pmd.ami_t1_current AS ami_t1,
+    pmd.mi_current AS mi,
+    pmd.HFpEF_current AS HFpEF,
+    CASE WHEN pmd.ascvd_current = 1 AND pmd.ckd3_4_current = 1 THEN 1 ELSE 0 END AS Z_flag,
+    CASE WHEN pmd.HFpEF_current = 1 THEN 1 ELSE 0 END AS H_flag,
+    CASE WHEN pmd.ami_t1_current = 1 THEN 1 ELSE 0 END AS A_flag
+FROM
+    patient_master_data pmd
+
+-- Limit the results for quick testing
+LIMIT 1000;
