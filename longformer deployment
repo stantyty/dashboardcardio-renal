@@ -1,0 +1,70 @@
+import os
+import mlflow
+import mlflow.pyfunc
+import tensorflow as tf
+from transformers import TFAutoModelForSequenceClassification, AutoTokenizer
+
+# Load your model and tokenizer
+model_path = './longformer_model'
+tokenizer_path = './longformer_model'
+
+model = TFAutoModelForSequenceClassification.from_pretrained(model_path)
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+# Define the custom MLflow PyFunc model
+class HFTransformerModel(mlflow.pyfunc.PythonModel):
+    def load_context(self, context):
+        from transformers import AutoTokenizer, TFAutoModelForSequenceClassification
+        self.tokenizer = AutoTokenizer.from_pretrained(context.artifacts["tokenizer_path"])
+        self.model = TFAutoModelForSequenceClassification.from_pretrained(context.artifacts["model_path"])
+
+    def predict(self, context, model_input):
+        texts = model_input['text'].tolist()
+        inputs = self.tokenizer(
+            texts,
+            return_tensors='tf',
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+        outputs = self.model(inputs)
+        logits = outputs.logits
+        probs = tf.nn.softmax(logits, axis=-1).numpy()
+        preds = tf.argmax(probs, axis=-1).numpy()
+        return pd.DataFrame({'prediction': preds, 'probabilities': probs.tolist()})
+
+# Define artifacts
+artifacts = {
+    'model_path': model_path,
+    'tokenizer_path': tokenizer_path
+}
+
+# Define the conda environment
+conda_env = {
+    'name': 'hf_transformer_env',
+    'channels': ['defaults'],
+    'dependencies': [
+        'python=3.8',
+        'pip',
+        {
+            'pip': [
+                'tensorflow',
+                'transformers==4.31.0',  # Replace with your version
+                'mlflow'
+            ],
+        },
+    ],
+}
+
+# Log the model to MLflow
+with mlflow.start_run() as run:
+    mlflow.pyfunc.log_model(
+        artifact_path='hf_longformer_model',
+        python_model=HFTransformerModel(),
+        artifacts=artifacts,
+        conda_env=conda_env
+    )
+
+    # Log parameters and metrics if available
+    # mlflow.log_param("epochs", num_epochs)
+    # mlflow.log_metric("val_f1_score", val_f1_score)
