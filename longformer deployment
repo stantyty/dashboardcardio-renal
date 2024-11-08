@@ -68,3 +68,89 @@ with mlflow.start_run() as run:
     # Log parameters and metrics if available
     # mlflow.log_param("epochs", num_epochs)
     # mlflow.log_metric("val_f1_score", val_f1_score)
+
+
+
+
+
+
+import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
+from collections import Counter
+import itertools
+from tqdm import tqdm
+import dataiku
+
+
+# Example: load a DSS dataset as a Pandas dataframe
+mydataset = dataiku.Dataset("Processed_Master")
+df = mydataset.get_dataframe()
+
+# Define the categories based on the flags
+categories = {
+    'Technical complaints': df[df['TECHNICAL COMPLAINT'] == 1],
+    'AE': df[(df['ADVERSE EVENT'] == 1) | (df['SERIOUS ADVERSE EVENT'] == 1)],
+    'Safety Only': df[df['SAFETY ONLY'] == 1]
+}
+
+def get_top_n_words(corpus, n=None):
+    vec = CountVectorizer(stop_words='english').fit(corpus)
+    bag_of_words = vec.transform(corpus)
+    sum_words = bag_of_words.sum(axis=0) 
+    words_freq = [(word, sum_words[0, idx]) for word, idx in vec.vocabulary_.items()]
+    words_freq = sorted(words_freq, key=lambda x: x[1], reverse=True)
+    return words_freq[:n]
+
+def get_top_n_bigrams(corpus, n=None):
+    vec = CountVectorizer(ngram_range=(2, 2), stop_words='english').fit(corpus)
+    bag_of_words = vec.transform(corpus)
+    sum_words = bag_of_words.sum(axis=0)
+    bigrams_freq = [(word, sum_words[0, idx]) for word, idx in vec.vocabulary_.items()]
+    bigrams_freq = sorted(bigrams_freq, key=lambda x: x[1], reverse=True)
+    return bigrams_freq[:n]
+
+# Number of top words/bigrams to retrieve
+N = 1000
+
+# DataFrames to store final results
+final_words_df = pd.DataFrame()
+final_bigrams_df = pd.DataFrame()
+
+# Process each category with progress bar
+for category, data in tqdm(categories.items(), desc="Processing Categories"):
+    corpus = data['Processed_text_Nostpwd'].dropna().tolist()
+    
+    # Get top words and bigrams
+    top_words = get_top_n_words(corpus, n=N)
+    top_bigrams = get_top_n_bigrams(corpus, n=N)
+    
+    # Convert to DataFrame and add category column
+    top_words_df = pd.DataFrame(top_words, columns=['Term', f'{category}_Word_Frequency'])
+    top_bigrams_df = pd.DataFrame(top_bigrams, columns=['Term', f'{category}_Bigram_Frequency'])
+    
+    # Merge results into a single DataFrame
+    if final_words_df.empty:
+        final_words_df = top_words_df
+    else:
+        final_words_df = final_words_df.merge(top_words_df, on='Term', how='outer')
+    
+    if final_bigrams_df.empty:
+        final_bigrams_df = top_bigrams_df
+    else:
+        final_bigrams_df = final_bigrams_df.merge(top_bigrams_df, on='Term', how='outer')
+
+# Fill NaN values with zero
+final_words_df = final_words_df.fillna(0)
+final_bigrams_df = final_bigrams_df.fillna(0)
+
+# Combine words and bigrams results
+final_results_df = pd.concat([final_words_df, final_bigrams_df], axis=0)
+
+# Sort the combined DataFrame by frequency and take the top 1000 items
+# Assuming the frequency columns end with '_Frequency'
+frequency_columns = [col for col in final_results_df.columns if col.endswith('_Frequency')]
+final_results_df['Total_Frequency'] = final_results_df[frequency_columns].sum(axis=1)
+final_results_df = final_results_df.sort_values(by='Total_Frequency', ascending=False).head(N)
+
+# Drop the Total_Frequency column as it's no longer needed
+final_results_df = final_results_df.drop(columns=['Total_Frequency'])
