@@ -1,90 +1,99 @@
-import os
-import mlflow
-import mlflow.pyfunc
-import tensorflow as tf
-from transformers import TFAutoModelForSequenceClassification, AutoTokenizer
-
-# Load your model and tokenizer
-model_path = './longformer_model'
-tokenizer_path = './longformer_model'
-
-model = TFAutoModelForSequenceClassification.from_pretrained(model_path)
-tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-# Define the custom MLflow PyFunc model
-class HFTransformerModel(mlflow.pyfunc.PythonModel):
-    def load_context(self, context):
-        from transformers import AutoTokenizer, TFAutoModelForSequenceClassification
-        self.tokenizer = AutoTokenizer.from_pretrained(context.artifacts["tokenizer_path"])
-        self.model = TFAutoModelForSequenceClassification.from_pretrained(context.artifacts["model_path"])
-
-    def predict(self, context, model_input):
-        texts = model_input['text'].tolist()
-        inputs = self.tokenizer(
-            texts,
-            return_tensors='tf',
-            padding=True,
-            truncation=True,
-            max_length=512
-        )
-        outputs = self.model(inputs)
-        logits = outputs.logits
-        probs = tf.nn.softmax(logits, axis=-1).numpy()
-        preds = tf.argmax(probs, axis=-1).numpy()
-        return pd.DataFrame({'prediction': preds, 'probabilities': probs.tolist()})
-
-# Define artifacts
-artifacts = {
-    'model_path': model_path,
-    'tokenizer_path': tokenizer_path
-}
-
-# Define the conda environment
-conda_env = {
-    'name': 'hf_transformer_env',
-    'channels': ['defaults'],
-    'dependencies': [
-        'python=3.8',
-        'pip',
-        {
-            'pip': [
-                'tensorflow',
-                'transformers==4.31.0',  # Replace with your version
-                'mlflow'
-            ],
-        },
-    ],
-}
-
-# Log the model to MLflow
-with mlflow.start_run() as run:
-    mlflow.pyfunc.log_model(
-        artifact_path='hf_longformer_model',
-        python_model=HFTransformerModel(),
-        artifacts=artifacts,
-        conda_env=conda_env
-    )
-
-    # Log parameters and metrics if available
-    # mlflow.log_param("epochs", num_epochs)
-    # mlflow.log_metric("val_f1_score", val_f1_score)
-
-
-
-
-
-
-import pandas as pd
-from sklearn.feature_extraction.text import CountVectorizer
-from collections import Counter
-import itertools
-from tqdm import tqdm
+    # Step 1: Load the Existing Keywords
 import dataiku
+import pandas as pd
+
+# Load 'ade_keyword' dataset
+ade_keyword_dataset = dataiku.Dataset('ade_keyword')
+ade_keywords_df = ade_keyword_dataset.get_dataframe()
+
+# Filter for 'Adverse Event' event_type
+ade_keywords_df = ade_keywords_df[ade_keywords_df['event_type'] == 'Adverse Event']
+
+# Extract the list of existing keywords
+existing_keywords = ade_keywords_df['keyword_name'].unique().tolist()
+print(f"Number of existing keywords: {len(existing_keywords)}")
+
+# Step 2: Load and Preprocess the Call Transcriptions
+# Load 'Processed_Master' dataset
+processed_master_dataset = dataiku.Dataset("Processed_Master")
+df = processed_master_dataset.get_dataframe()
+
+# Combine all text into a list for training
+texts = df['Processed_text_Nostpwd'].dropna().tolist()
+
+# Preprocess the text
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+import re
+
+# Download NLTK data if not already downloaded
+nltk.download('punkt')
+nltk.download('stopwords')
+
+stop_words = set(stopwords.words('english'))
+
+def preprocess_text(text):
+    # Lowercase
+    text = text.lower()
+    # Remove special characters and numbers
+    text = re.sub(r'[^a-z\s]', '', text)
+    # Tokenize
+    tokens = word_tokenize(text)
+    # Remove stopwords
+    tokens = [word for word in tokens if word not in stop_words]
+    return tokens
+
+# Apply preprocessing
+processed_texts = [preprocess_text(text) for text in texts]
+
+# Step 3: Train Word2Vec Model
+from gensim.models import Word2Vec
+
+# Train the model
+model = Word2Vec(sentences=processed_texts, vector_size=100, window=5, min_count=5, workers=4)
+
+# Step 4: Find Similar Words
+similar_words = set()
+
+for keyword in existing_keywords:
+    keyword = keyword.lower()
+    if keyword in model.wv:
+        # Get top 10 similar words
+        similar = model.wv.most_similar(keyword, topn=10)
+        similar_words.update([word for word, score in similar])
+    else:
+        print(f"Keyword '{keyword}' not found in vocabulary.")
+
+# Combine existing keywords with similar words
+expanded_keywords = set(existing_keywords)
+expanded_keywords.update(similar_words)
+
+print(f"Number of expanded keywords: {len(expanded_keywords)}")
+
+# Step 5: Save the Expanded Keyword List
+# Convert to DataFrame
+expanded_keywords_df = pd.DataFrame({'keyword_name': list(expanded_keywords)})
+
+# Save to Dataiku dataset
+expanded_keywords_dataset = dataiku.Dataset("expanded_ade_keywords")
+expanded_keywords_dataset.write_with_schema(expanded_keywords_df)
 
 
-# Example: load a DSS dataset as a Pandas dataframe
-mydataset = dataiku.Dataset("Processed_Master")
-df = mydataset.get_dataframe()
+
+
+
+
+# Step 1: Load and Preprocess the Data
+import dataiku
+import pandas as pd
+import nltk
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Load 'Processed_Master' dataset
+processed_master_dataset = dataiku.Dataset("Processed_Master")
+df = processed_master_dataset.get_dataframe()
 
 # Define the categories based on the flags
 categories = {
@@ -93,64 +102,282 @@ categories = {
     'Safety Only': df[df['SAFETY ONLY'] == 1]
 }
 
-def get_top_n_words(corpus, n=None):
-    vec = CountVectorizer(stop_words='english').fit(corpus)
-    bag_of_words = vec.transform(corpus)
-    sum_words = bag_of_words.sum(axis=0) 
-    words_freq = [(word, sum_words[0, idx]) for word, idx in vec.vocabulary_.items()]
-    words_freq = sorted(words_freq, key=lambda x: x[1], reverse=True)
-    return words_freq[:n]
+# Ensure NLTK data is downloaded
+nltk.download('punkt')
+nltk.download('stopwords')
+nltk.download('wordnet')
 
-def get_top_n_bigrams(corpus, n=None):
-    vec = CountVectorizer(ngram_range=(2, 2), stop_words='english').fit(corpus)
-    bag_of_words = vec.transform(corpus)
-    sum_words = bag_of_words.sum(axis=0)
-    bigrams_freq = [(word, sum_words[0, idx]) for word, idx in vec.vocabulary_.items()]
-    bigrams_freq = sorted(bigrams_freq, key=lambda x: x[1], reverse=True)
-    return bigrams_freq[:n]
+# Initialize lemmatizer and stopwords
+from nltk.stem import WordNetLemmatizer
+lemmatizer = WordNetLemmatizer()
+stop_words = set(stopwords.words('english'))
 
-# Number of top words/bigrams to retrieve
-N = 1000
+# Add custom stopwords
+custom_stopwords = set(['patient', 'doctor', 'medicine', 'drug', 'use', 'take', 'get', 'feel', 'would', 'could'])
+stop_words.update(custom_stopwords)
 
-# DataFrames to store final results
-final_words_df = pd.DataFrame()
-final_bigrams_df = pd.DataFrame()
+def preprocess_text(text):
+    # Lowercase
+    text = text.lower()
+    # Remove special characters and numbers
+    text = re.sub(r'[^a-z\s]', '', text)
+    # Tokenize
+    tokens = nltk.word_tokenize(text)
+    # Remove stopwords
+    tokens = [word for word in tokens if word not in stop_words]
+    # Lemmatize
+    tokens = [lemmatizer.lemmatize(word) for word in tokens]
+    return ' '.join(tokens)
 
-# Process each category with progress bar
-for category, data in tqdm(categories.items(), desc="Processing Categories"):
-    corpus = data['Processed_text_Nostpwd'].dropna().tolist()
+# Step 2: Process Texts and Extract N-Grams
+for category_name, category_df in categories.items():
+    print(f"Processing category: {category_name}")
+    texts = category_df['Processed_text_Nostpwd'].dropna().tolist()
+    # Preprocess texts
+    processed_texts = [preprocess_text(text) for text in texts]
     
-    # Get top words and bigrams
-    top_words = get_top_n_words(corpus, n=N)
-    top_bigrams = get_top_n_bigrams(corpus, n=N)
+    # Initialize TfidfVectorizer for unigrams
+    vectorizer_uni = TfidfVectorizer(ngram_range=(1,1), max_features=1500)
+    tfidf_uni = vectorizer_uni.fit_transform(processed_texts)
+    unigram_features = vectorizer_uni.get_feature_names_out()
+    unigram_scores = tfidf_uni.sum(axis=0).A1
+    unigram_df = pd.DataFrame({'ngram': unigram_features, 'score': unigram_scores})
+    unigram_df = unigram_df.sort_values(by='score', ascending=False)
     
-    # Convert to DataFrame and add category column
-    top_words_df = pd.DataFrame(top_words, columns=['Term', f'{category}_Word_Frequency'])
-    top_bigrams_df = pd.DataFrame(top_bigrams, columns=['Term', f'{category}_Bigram_Frequency'])
+    # Initialize TfidfVectorizer for bigrams
+    vectorizer_bi = TfidfVectorizer(ngram_range=(2,2), max_features=1500)
+    tfidf_bi = vectorizer_bi.fit_transform(processed_texts)
+    bigram_features = vectorizer_bi.get_feature_names_out()
+    bigram_scores = tfidf_bi.sum(axis=0).A1
+    bigram_df = pd.DataFrame({'ngram': bigram_features, 'score': bigram_scores})
+    bigram_df = bigram_df.sort_values(by='score', ascending=False)
     
-    # Merge results into a single DataFrame
-    if final_words_df.empty:
-        final_words_df = top_words_df
-    else:
-        final_words_df = final_words_df.merge(top_words_df, on='Term', how='outer')
+    # Initialize TfidfVectorizer for trigrams
+    vectorizer_tri = TfidfVectorizer(ngram_range=(3,3), max_features=1500)
+    tfidf_tri = vectorizer_tri.fit_transform(processed_texts)
+    trigram_features = vectorizer_tri.get_feature_names_out()
+    trigram_scores = tfidf_tri.sum(axis=0).A1
+    trigram_df = pd.DataFrame({'ngram': trigram_features, 'score': trigram_scores})
+    trigram_df = trigram_df.sort_values(by='score', ascending=False)
     
-    if final_bigrams_df.empty:
-        final_bigrams_df = top_bigrams_df
-    else:
-        final_bigrams_df = final_bigrams_df.merge(top_bigrams_df, on='Term', how='outer')
+    # Combine n-grams
+    ngram_df = pd.concat([unigram_df, bigram_df, trigram_df], ignore_index=True)
+    ngram_df = ngram_df.sort_values(by='score', ascending=False)
+    
+    # Remove any n-grams containing only stopwords or non-informative words
+    ngram_df['is_informative'] = ngram_df['ngram'].apply(
+        lambda x: all(word not in stop_words for word in x.split())
+    )
+    ngram_df = ngram_df[ngram_df['is_informative']]
+    
+    # Select top 1000 n-grams
+    top_ngrams = ngram_df.head(1000)
+    
+    # Save to Dataiku dataset
+    dataset_name = f"keywords_{category_name.replace(' ', '_')}"
+    dataset = dataiku.Dataset(dataset_name)
+    dataset.write_with_schema(top_ngrams[['ngram', 'score']])
+    
+    print(f"Saved top n-grams for category '{category_name}' to dataset '{dataset_name}'")
 
-# Fill NaN values with zero
-final_words_df = final_words_df.fillna(0)
-final_bigrams_df = final_bigrams_df.fillna(0)
 
-# Combine words and bigrams results
-final_results_df = pd.concat([final_words_df, final_bigrams_df], axis=0)
 
-# Sort the combined DataFrame by frequency and take the top 1000 items
-# Assuming the frequency columns end with '_Frequency'
-frequency_columns = [col for col in final_results_df.columns if col.endswith('_Frequency')]
-final_results_df['Total_Frequency'] = final_results_df[frequency_columns].sum(axis=1)
-final_results_df = final_results_df.sort_values(by='Total_Frequency', ascending=False).head(N)
 
-# Drop the Total_Frequency column as it's no longer needed
-final_results_df = final_results_df.drop(columns=['Total_Frequency'])
+
+
+
+
+
+Category 1: Technical Complaints
+Device Failures and Malfunctions
+Malfunction
+Device failure
+Not working
+Stopped working
+Broken device
+Faulty device
+Defective insulin pen
+Pen malfunction
+Device error
+Error message
+Glitch
+Frozen screen
+Unresponsive
+Intermittent function
+Power failure
+Battery issue
+Calibration problem
+Needle jam
+Stuck plunger
+Dose not dispensing
+Inaccurate dosing
+Leakage
+Leaking insulin
+Cracked casing
+Button not working
+Display issue
+Screen flickering
+Mechanical failure
+Software bug
+Overheating
+Illegitimacy/Potential Counterfeit
+Counterfeit product
+Fake insulin pen
+Illegitimate device
+Unauthorized seller
+Suspicious packaging
+Tampered seal
+Unusual markings
+Not authentic
+Expired product
+Recalled device
+Black market
+Packaging Errors and Defects
+Packaging error
+Damaged packaging
+Missing components
+Incorrect labeling
+Mislabeled
+Leaking package
+Defective packaging
+Broken seal
+Improper sealing
+Contaminated packaging
+Opened package
+Inadequate instructions
+No user manual
+Incomplete kit
+Wrong product inside
+Category 2: Adverse Events
+Side Effects and Adverse Reactions
+Side effect
+Adverse reaction
+Allergic reaction
+Anaphylaxis
+Rash
+Hives
+Swelling
+Itching
+Redness
+Difficulty breathing
+Shortness of breath
+Chest pain
+Dizziness
+Lightheadedness
+Headache
+Nausea
+Vomiting
+Diarrhea
+Stomach pain
+Abdominal cramps
+Fatigue
+Weakness
+Muscle pain
+Joint pain
+Fever
+Chills
+Sweating
+Blurred vision
+Tremors
+Palpitations
+Anxiety
+Outcomes Due to Medication or Device Use
+Hypoglycemia
+Low blood sugar
+Hyperglycemia
+High blood sugar
+Blood sugar spikes
+Blood sugar drops
+Seizure
+Loss of consciousness
+Fainting
+Coma
+Weight gain
+Weight loss
+Injection site reaction
+Infection
+Abscess
+Scarring
+Lipodystrophy
+Lipoatrophy
+Skin irritation
+Bruising
+Suspected Transmission of Infectious Agents
+Infection transmission
+Contaminated insulin
+Bloodborne pathogen
+Hepatitis
+HIV exposure
+Contaminated device
+Sterility issue
+Sepsis
+Bacterial contamination
+Viral infection
+Category 3: Safety Only
+Pregnancy and Exposure
+Pregnancy
+Pregnant
+Expecting
+Fetus exposure
+Prenatal exposure
+Breastfeeding
+Nursing mother
+Congenital anomaly
+Birth defect
+Miscarriage
+Stillbirth
+Preterm labor
+Low birth weight
+Prenatal care
+Gestational diabetes
+Overdose, Abuse, and Misuse
+Overdose
+Accidental overdose
+Intentional overdose
+Double dose
+Extra dose
+Missed dose
+Forgot dose
+Wrong dose
+Dose error
+Medication error
+Drug abuse
+Substance abuse
+Misuse
+Recreational use
+Non-prescribed use
+Addiction
+Dependency
+Self-harm
+Suicide attempt
+Occupational Exposure and Medication Errors
+Occupational exposure
+Needlestick injury
+Accidental exposure
+Healthcare worker exposure
+Pharmacist error
+Dispensing error
+Administration error
+Wrong medication
+Incorrect route
+Wrong patient
+Wrong time
+Improper storage
+Expired medication
+Labeling error
+Instruction error
+Dosage miscalculation
+Other Safety Concerns
+Drug interaction
+Contraindication
+Off-label use
+Unauthorized use
+Noncompliance
+Non-adherence
+Sharing medication
+Lost medication
+Stolen medication
+Illicit use
+Unapproved therapy
+Experimental use
+Clinical trial participation
