@@ -89,7 +89,7 @@ import dataiku
 import pandas as pd
 import nltk
 import re
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
 
 # Load 'Processed_Master' dataset
 processed_master_dataset = dataiku.Dataset("Processed_Master")
@@ -110,9 +110,9 @@ nltk.download('wordnet')
 # Initialize lemmatizer and stopwords
 from nltk.stem import WordNetLemmatizer
 lemmatizer = WordNetLemmatizer()
-stop_words = set(stopwords.words('english'))
+stop_words = set(nltk.corpus.stopwords.words('english'))
 
-# Add custom stopwords
+# Add custom stopwords (if any)
 custom_stopwords = set(['patient', 'doctor', 'medicine', 'drug', 'use', 'take', 'get', 'feel', 'would', 'could'])
 stop_words.update(custom_stopwords)
 
@@ -136,49 +136,52 @@ for category_name, category_df in categories.items():
     # Preprocess texts
     processed_texts = [preprocess_text(text) for text in texts]
     
-    # Initialize TfidfVectorizer for unigrams
-    vectorizer_uni = TfidfVectorizer(ngram_range=(1,1), max_features=1500)
-    tfidf_uni = vectorizer_uni.fit_transform(processed_texts)
+    # Initialize CountVectorizer for unigrams
+    vectorizer_uni = CountVectorizer(ngram_range=(1,1), stop_words='english')
+    unigram_counts = vectorizer_uni.fit_transform(processed_texts)
     unigram_features = vectorizer_uni.get_feature_names_out()
-    unigram_scores = tfidf_uni.sum(axis=0).A1
-    unigram_df = pd.DataFrame({'ngram': unigram_features, 'score': unigram_scores})
-    unigram_df = unigram_df.sort_values(by='score', ascending=False)
+    unigram_totals = unigram_counts.sum(axis=0).A1
+    unigram_df = pd.DataFrame({'ngram': unigram_features, 'count': unigram_totals})
+    unigram_df = unigram_df.sort_values(by='count', ascending=False)
     
-    # Initialize TfidfVectorizer for bigrams
-    vectorizer_bi = TfidfVectorizer(ngram_range=(2,2), max_features=1500)
-    tfidf_bi = vectorizer_bi.fit_transform(processed_texts)
+    # Initialize CountVectorizer for bigrams
+    vectorizer_bi = CountVectorizer(ngram_range=(2,2), stop_words='english')
+    bigram_counts = vectorizer_bi.fit_transform(processed_texts)
     bigram_features = vectorizer_bi.get_feature_names_out()
-    bigram_scores = tfidf_bi.sum(axis=0).A1
-    bigram_df = pd.DataFrame({'ngram': bigram_features, 'score': bigram_scores})
-    bigram_df = bigram_df.sort_values(by='score', ascending=False)
+    bigram_totals = bigram_counts.sum(axis=0).A1
+    bigram_df = pd.DataFrame({'ngram': bigram_features, 'count': bigram_totals})
+    bigram_df = bigram_df.sort_values(by='count', ascending=False)
     
-    # Initialize TfidfVectorizer for trigrams
-    vectorizer_tri = TfidfVectorizer(ngram_range=(3,3), max_features=1500)
-    tfidf_tri = vectorizer_tri.fit_transform(processed_texts)
+    # Initialize CountVectorizer for trigrams
+    vectorizer_tri = CountVectorizer(ngram_range=(3,3), stop_words='english')
+    trigram_counts = vectorizer_tri.fit_transform(processed_texts)
     trigram_features = vectorizer_tri.get_feature_names_out()
-    trigram_scores = tfidf_tri.sum(axis=0).A1
-    trigram_df = pd.DataFrame({'ngram': trigram_features, 'score': trigram_scores})
-    trigram_df = trigram_df.sort_values(by='score', ascending=False)
+    trigram_totals = trigram_counts.sum(axis=0).A1
+    trigram_df = pd.DataFrame({'ngram': trigram_features, 'count': trigram_totals})
+    trigram_df = trigram_df.sort_values(by='count', ascending=False)
     
     # Combine n-grams
     ngram_df = pd.concat([unigram_df, bigram_df, trigram_df], ignore_index=True)
-    ngram_df = ngram_df.sort_values(by='score', ascending=False)
+    ngram_df = ngram_df.sort_values(by='count', ascending=False)
     
-    # Remove any n-grams containing only stopwords or non-informative words
-    ngram_df['is_informative'] = ngram_df['ngram'].apply(
-        lambda x: all(word not in stop_words for word in x.split())
-    )
-    ngram_df = ngram_df[ngram_df['is_informative']]
+    # Remove any n-grams containing stopwords or non-informative words
+    def is_informative(ngram):
+        words = ngram.split()
+        return all(word not in stop_words for word in words)
     
-    # Select top 1000 n-grams
-    top_ngrams = ngram_df.head(1000)
+    ngram_df = ngram_df[ngram_df['ngram'].apply(is_informative)]
+    
+    # Select top N n-grams (e.g., top 1000)
+    top_n = 1000
+    top_ngrams = ngram_df.head(top_n)
     
     # Save to Dataiku dataset
     dataset_name = f"keywords_{category_name.replace(' ', '_')}"
     dataset = dataiku.Dataset(dataset_name)
-    dataset.write_with_schema(top_ngrams[['ngram', 'score']])
+    dataset.write_with_schema(top_ngrams[['ngram', 'count']])
     
     print(f"Saved top n-grams for category '{category_name}' to dataset '{dataset_name}'")
+
 
 
 
