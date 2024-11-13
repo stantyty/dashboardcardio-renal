@@ -190,197 +190,91 @@ for category_name, category_df in categories.items():
 
 
 
+# Step 1: Preprocess the Data
+import dataiku
+import pandas as pd
+import nltk
+import re
+from sklearn.feature_extraction.text import CountVectorizer
 
-Category 1: Technical Complaints
-Device Failures and Malfunctions
-Malfunction
-Device failure
-Not working
-Stopped working
-Broken device
-Faulty device
-Defective insulin pen
-Pen malfunction
-Device error
-Error message
-Glitch
-Frozen screen
-Unresponsive
-Intermittent function
-Power failure
-Battery issue
-Calibration problem
-Needle jam
-Stuck plunger
-Dose not dispensing
-Inaccurate dosing
-Leakage
-Leaking insulin
-Cracked casing
-Button not working
-Display issue
-Screen flickering
-Mechanical failure
-Software bug
-Overheating
-Illegitimacy/Potential Counterfeit
-Counterfeit product
-Fake insulin pen
-Illegitimate device
-Unauthorized seller
-Suspicious packaging
-Tampered seal
-Unusual markings
-Not authentic
-Expired product
-Recalled device
-Black market
-Packaging Errors and Defects
-Packaging error
-Damaged packaging
-Missing components
-Incorrect labeling
-Mislabeled
-Leaking package
-Defective packaging
-Broken seal
-Improper sealing
-Contaminated packaging
-Opened package
-Inadequate instructions
-No user manual
-Incomplete kit
-Wrong product inside
-Category 2: Adverse Events
-Side Effects and Adverse Reactions
-Side effect
-Adverse reaction
-Allergic reaction
-Anaphylaxis
-Rash
-Hives
-Swelling
-Itching
-Redness
-Difficulty breathing
-Shortness of breath
-Chest pain
-Dizziness
-Lightheadedness
-Headache
-Nausea
-Vomiting
-Diarrhea
-Stomach pain
-Abdominal cramps
-Fatigue
-Weakness
-Muscle pain
-Joint pain
-Fever
-Chills
-Sweating
-Blurred vision
-Tremors
-Palpitations
-Anxiety
-Outcomes Due to Medication or Device Use
-Hypoglycemia
-Low blood sugar
-Hyperglycemia
-High blood sugar
-Blood sugar spikes
-Blood sugar drops
-Seizure
-Loss of consciousness
-Fainting
-Coma
-Weight gain
-Weight loss
-Injection site reaction
-Infection
-Abscess
-Scarring
-Lipodystrophy
-Lipoatrophy
-Skin irritation
-Bruising
-Suspected Transmission of Infectious Agents
-Infection transmission
-Contaminated insulin
-Bloodborne pathogen
-Hepatitis
-HIV exposure
-Contaminated device
-Sterility issue
-Sepsis
-Bacterial contamination
-Viral infection
-Category 3: Safety Only
-Pregnancy and Exposure
-Pregnancy
-Pregnant
-Expecting
-Fetus exposure
-Prenatal exposure
-Breastfeeding
-Nursing mother
-Congenital anomaly
-Birth defect
-Miscarriage
-Stillbirth
-Preterm labor
-Low birth weight
-Prenatal care
-Gestational diabetes
-Overdose, Abuse, and Misuse
-Overdose
-Accidental overdose
-Intentional overdose
-Double dose
-Extra dose
-Missed dose
-Forgot dose
-Wrong dose
-Dose error
-Medication error
-Drug abuse
-Substance abuse
-Misuse
-Recreational use
-Non-prescribed use
-Addiction
-Dependency
-Self-harm
-Suicide attempt
-Occupational Exposure and Medication Errors
-Occupational exposure
-Needlestick injury
-Accidental exposure
-Healthcare worker exposure
-Pharmacist error
-Dispensing error
-Administration error
-Wrong medication
-Incorrect route
-Wrong patient
-Wrong time
-Improper storage
-Expired medication
-Labeling error
-Instruction error
-Dosage miscalculation
-Other Safety Concerns
-Drug interaction
-Contraindication
-Off-label use
-Unauthorized use
-Noncompliance
-Non-adherence
-Sharing medication
-Lost medication
-Stolen medication
-Illicit use
-Unapproved therapy
-Experimental use
-Clinical trial participation
+# If NLTK data is not downloaded, uncomment the following lines:
+# nltk.download('punkt')
+# nltk.download('stopwords')
+# nltk.download('wordnet')
+
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+# Initialize lemmatizer and stopwords
+lemmatizer = WordNetLemmatizer()
+stop_words = set(stopwords.words('english'))
+
+# Add custom stopwords if needed
+custom_stopwords = set(['patient', 'doctor', 'medicine', 'drug', 'use', 'take', 'get', 'feel', 'would', 'could'])
+stop_words.update(custom_stopwords)
+
+def preprocess_text(text):
+    # Convert to lowercase
+    text = text.lower()
+    # Remove special characters and numbers
+    text = re.sub(r'[^a-z\s]', '', text)
+    # Tokenize
+    tokens = nltk.word_tokenize(text)
+    # Remove stopwords
+    tokens = [word for word in tokens if word not in stop_words]
+    # Lemmatize
+    tokens = [lemmatizer.lemmatize(word) for word in tokens]
+    # Join tokens back into a string
+    return ' '.join(tokens)
+
+# Apply preprocessing to the text column
+ae_df['processed_text'] = ae_df['col_1'].apply(preprocess_text)
+
+# Step 2: Extract Unigrams Using CountVectorizer
+vectorizer_uni = CountVectorizer(ngram_range=(1,1))
+X_uni_counts = vectorizer_uni.fit_transform(ae_df['processed_text'])
+
+# Get the unigram features and their counts
+unigram_features = vectorizer_uni.get_feature_names_out()
+unigram_counts = X_uni_counts.sum(axis=0).A1  # Sum over all documents to get total counts
+
+# Create a dataframe with unigrams and their counts
+unigram_df = pd.DataFrame({'unigram': unigram_features, 'count': unigram_counts})
+
+# Sort the unigrams by frequency
+unigram_df = unigram_df.sort_values(by='count', ascending=False)
+
+# Select Top 1500 Unigrams
+top_1500_unigrams = unigram_df.head(1500)
+
+# Step 3: Extract Bigrams Using CountVectorizer
+vectorizer_bi = CountVectorizer(ngram_range=(2,2))
+X_bi_counts = vectorizer_bi.fit_transform(ae_df['processed_text'])
+
+# Get the bigram features and their counts
+bigram_features = vectorizer_bi.get_feature_names_out()
+bigram_counts = X_bi_counts.sum(axis=0).A1  # Sum over all documents to get total counts
+
+# Create a dataframe with bigrams and their counts
+bigram_df = pd.DataFrame({'bigram': bigram_features, 'count': bigram_counts})
+
+# Sort the bigrams by frequency
+bigram_df = bigram_df.sort_values(by='count', ascending=False)
+
+# Select Top 1500 Bigrams
+top_1500_bigrams = bigram_df.head(1500)
+
+# Step 4: Save the Results to Dataiku Datasets
+# Create Dataiku datasets (replace dataset names if needed)
+unigrams_dataset = dataiku.Dataset('ae_top_unigrams')
+bigrams_dataset = dataiku.Dataset('ae_top_bigrams')
+
+# Write the top unigrams to the dataset
+unigrams_dataset.write_with_schema(top_1500_unigrams)
+
+# Write the top bigrams to the dataset
+bigrams_dataset.write_with_schema(top_1500_bigrams)
+
+print("Top 1500 unigrams have been saved to the 'ae_top_unigrams' dataset.")
+print("Top 1500 bigrams have been saved to the 'ae_top_bigrams' dataset.")
+
