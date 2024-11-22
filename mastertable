@@ -1,27 +1,80 @@
--- Define diagnosis code lists
-WITH ASCVD_CODE AS (SELECT 'code1' AS code UNION ALL SELECT 'code2' UNION ALL SELECT 'code3'),
-     CKD_CODE AS (SELECT 'code4' AS code UNION ALL SELECT 'code5'),
-     CKD_3_4_CODE AS (SELECT 'code6' AS code UNION ALL SELECT 'code7'),
-     AMI_T1_CODE AS (SELECT 'code8' AS code UNION ALL SELECT 'code9'),
-     MI_CODE AS (SELECT 'code10' AS code UNION ALL SELECT 'code11'),
-     HFpEF_CODE AS (SELECT 'code12' AS code UNION ALL SELECT 'code13'),
+Below is a query to pull a patient master table from LAAD data for a dashboard project for cardio renal domain. 
+We want to change the plan and want to revise the master table layout, rather than make it a patient level data, we want to keep the data to claim level, for each claim, we will have the DX code, so we can find out the DX flags like what we did in the existing query, and we can find the correspoinding rendering HCPS and their specialties. In this new layout case, we can invovle analysis of HCPs.
+Due to the data volume concern, we limit the new master table to only the paitient cohort in the CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10 scope as we did in the previous query.
+As I mentioned, for HCPs related field, we will include 'NNI_RENDERING_PR_SPEC_GROUP' for the group and  'NNI_RENDERING_PR_SPEC_NAME' for the individual specality, NNI_RENDERING_CUSTOMER_ID is the id of HCPS, 'zip' as their zip_code and 'state' as their statelevel location.
+We are going to remove the filter of 'time_period', but we will leverage the 'service_date' of each claim, so we can create the similar filter on tableau side easily(rather than built it into the master table). for each row, we still maintain all the patients' characteristics, the patients information as the way joined in below query. We want to keep making the patient's DX flag based on each claim's diagnosis code(as we are on claim level)
+We want to aggregate and generate a field, which I consider is the tricky part of this new query. For each row, we want to have a "total Dx grouping flag" associate with the patient, to locate the qualified dx flags via patient's all time history in the table. And qualified Dx will be seperated by commas so we can parse them out on tableau. example field value, for a patient ever diagnosed ASCVD, CKD, CKD34, MI. The field value is "ASCVD, CKD, CKD34, MI"
 
--- Combine all diagnosis codes into a single list for filtering
-ALL_CODES AS (
-    SELECT code FROM ASCVD_CODE
-    UNION
-    SELECT code FROM CKD_CODE
-    UNION
-    SELECT code FROM CKD_3_4_CODE
-    UNION
-    SELECT code FROM AMI_T1_CODE
-    UNION
-    SELECT code FROM MI_CODE
-    UNION
-    SELECT code FROM HFpEF_CODE
+Please consider the computational efficiency when design the query, make clear notes to the code so we can understand. I think most of the logic can be learnt from the below query, especially the relationship between DX and ICD10 code list.
+
+ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 144000;
+USE DATABASE "AANALYTICS_PROD";
+USE SCHEMA "WORKSPACE";
+
+-- Set the latest service date variable
+SET LATEST_SERVICE_DATE = (
+    SELECT LAST_DAY(MAX(SERVICE_DATE), 'month') 
+    FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX"
+);
+
+-- Set the start date variable (12 months before the latest service date)
+SET START_DATE = (
+    SELECT DATE_TRUNC('month', DATEADD(month, -11, $LATEST_SERVICE_DATE))
+);
+
+CREATE TABLE Project_Odyssey_Master_datatable_XXXX AS
+
+With ASCVD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE ASCVD = 'Y' 
+  ),
+CKD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE CKD = 'Y' 
 ),
-
--- Filter relevant diagnoses and limit data volume for testing
+HF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE "Heart Failure" = 'Y' 
+),
+HFpEF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE "HFpEF" = 'Y' 
+),
+MI_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE MI = 'Y' 
+),
+AMI_T1_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE "AMI Type 1" = 'Y' 
+),
+CKD_3_4_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  WHERE "CKD3&4" = 'Y' 
+),
+ALL_CODES AS (
+    SELECT DIAG_CD FROM ASCVD_CODE
+    UNION
+    SELECT DIAG_CD FROM CKD_CODE
+    UNION
+    SELECT DIAG_CD FROM CKD_3_4_CODE
+    UNION
+    SELECT DIAG_CD FROM AMI_T1_CODE
+    UNION
+    SELECT DIAG_CD FROM MI_CODE
+    UNION
+    SELECT DIAG_CD FROM HFpEF_CODE
+    UNION
+    SELECT DIAG_CD FROM HF_CODE
+),
+-- Filter relevant diagnoses to reduce data volume
 relevant_diagnoses AS (
     SELECT
         patient_id,
@@ -29,22 +82,12 @@ relevant_diagnoses AS (
         SERVICE_DATE,
         PATIENT_BIRTH_YEAR,
         PATIENT_GENDER
-    FROM (
-        SELECT
-            patient_id,
-            diagnosis_code,
-            SERVICE_DATE,
-            PATIENT_BIRTH_YEAR,
-            PATIENT_GENDER
-        FROM
-            PTAB_F_LAAD_CONSOLIDATED_DX
-        WHERE
-            diagnosis_code IN (SELECT code FROM ALL_CODES)
-        LIMIT 1000  -- Limit applied here for quick testing
-    ) rd
+    FROM
+        "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX"
+    WHERE
+        diagnosis_code IN (SELECT DIAG_CD FROM ALL_CODES)
 ),
-
--- Create diagnosis flags and latest diagnostic times per patient
+-- CREATE DIAGNOSIS FLAGS PER PATIENT FOR ALL TIME AND CURRENT 12 MONTHS
 diagnosis_flags AS (
     SELECT
         rd.patient_id,
@@ -52,36 +95,40 @@ diagnosis_flags AS (
         rd.PATIENT_GENDER,
 
         -- Flags for 'ALL TIME'
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM ASCVD_CODE) THEN 1 ELSE 0 END) AS ascvd_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_CODE) THEN 1 ELSE 0 END) AS ckd_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_3_4_CODE) THEN 1 ELSE 0 END) AS ckd3_4_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM AMI_T1_CODE) THEN 1 ELSE 0 END) AS ami_t1_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM MI_CODE) THEN 1 ELSE 0 END) AS mi_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM HFpEF_CODE) THEN 1 ELSE 0 END) AS HFpEF_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM ASCVD_CODE) THEN 1 ELSE 0 END) AS ascvd_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_CODE) THEN 1 ELSE 0 END) AS ckd_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_3_4_CODE) THEN 1 ELSE 0 END) AS ckd3_4_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM AMI_T1_CODE) THEN 1 ELSE 0 END) AS ami_t1_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM MI_CODE) THEN 1 ELSE 0 END) AS mi_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HFpEF_CODE) THEN 1 ELSE 0 END) AS HFpEF_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HF_CODE) THEN 1 ELSE 0 END) AS HF_all_time,
 
         -- Latest diagnostic dates for 'ALL TIME'
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM ASCVD_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ascvd_latest_date_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ckd_latest_date_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_3_4_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ckd3_4_latest_date_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM AMI_T1_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ami_t1_latest_date_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM MI_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS mi_latest_date_all_time,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM HFpEF_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS HFpEF_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM ASCVD_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ascvd_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ckd_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_3_4_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ckd3_4_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM AMI_T1_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS ami_t1_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM MI_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS mi_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HFpEF_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS HFpEF_latest_date_all_time,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HF_CODE) THEN rd.SERVICE_DATE ELSE NULL END) AS HF_latest_date_all_time,
 
-        -- Flags for 'CURRENT(12MONTH)'
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM ASCVD_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ascvd_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ckd_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_3_4_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ckd3_4_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM AMI_T1_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS ami_t1_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM MI_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS mi_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM HFpEF_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN 1 ELSE 0 END) AS HFpEF_current,
+        -- Flags for 'CURRENT(12MONTH)' ## 12 months from most lastest date 
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM ASCVD_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS ascvd_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS ckd_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_3_4_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS ckd3_4_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM AMI_T1_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS ami_t1_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM MI_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS mi_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HFpEF_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS HFpEF_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HF_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN 1 ELSE 0 END) AS HF_current,
 
         -- Latest diagnostic dates for 'CURRENT(12MONTH)'
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM ASCVD_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN rd.SERVICE_DATE ELSE NULL END) AS ascvd_latest_date_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN rd.SERVICE_DATE ELSE NULL END) AS ckd_latest_date_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM CKD_3_4_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN rd.SERVICE_DATE ELSE NULL END) AS ckd3_4_latest_date_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM AMI_T1_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN rd.SERVICE_DATE ELSE NULL END) AS ami_t1_latest_date_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM MI_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN rd.SERVICE_DATE ELSE NULL END) AS mi_latest_date_current,
-        MAX(CASE WHEN rd.diagnosis_code IN (SELECT code FROM HFpEF_CODE) AND rd.SERVICE_DATE BETWEEN '2023-09-01' AND '2024-09-01' THEN rd.SERVICE_DATE ELSE NULL END) AS HFpEF_latest_date_current
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM ASCVD_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS ascvd_latest_date_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS ckd_latest_date_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM CKD_3_4_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS ckd3_4_latest_date_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM AMI_T1_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS ami_t1_latest_date_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM MI_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS mi_latest_date_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HFpEF_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS HFpEF_latest_date_current,
+        MAX(CASE WHEN rd.diagnosis_code IN (SELECT DIAG_CD FROM HF_CODE) AND rd.SERVICE_DATE BETWEEN $START_DATE AND $LATEST_SERVICE_DATE THEN rd.SERVICE_DATE ELSE NULL END) AS HF_latest_date_current
 
     FROM
         relevant_diagnoses rd
@@ -90,19 +137,17 @@ diagnosis_flags AS (
         rd.PATIENT_BIRTH_YEAR,
         rd.PATIENT_GENDER
 ),
-
--- Combine diagnosis flags with additional patient data
+-- Combine diagnosis flags with demographics
 patient_master_data AS (
     SELECT
         d.patient_id,
-        d.PATIENT_BIRTH_YEAR,
-        2024 - CAST(SUBSTRING(d.PATIENT_BIRTH_YEAR, 1, 4) AS INTEGER) AS age,
-        d.PATIENT_GENDER,
-        s."Access To Medication Score 1" AS access_to_medication,
-        s."Food Insecurity Score 1" AS food_insecurity,
-        s."Access To Care Score 1" AS access_to_care,
-        s."Housing Instability Score 1" AS housing_instability,
-        s."Sdoh Total 1" AS total_risk,
+        d.PATIENT_BIRTH_YEAR AS age,
+        d.PATIENT_GENDER AS gender,
+        s.Access_To_Medication_Score_1 AS access_to_medication,
+        s.Food_Insecurity_Score_1 AS food_insecurity,
+        s.Access_To_Care_Score_1 AS access_to_care,
+        s.Housing_Instability_Score_1 AS housing_instability,
+        s.Sdoh_Total_1 AS total_risk,
         s.ethnic_ind AS ethnicity,
         s.EDUC_ind AS education,
 
@@ -113,12 +158,14 @@ patient_master_data AS (
         d.ami_t1_all_time,
         d.mi_all_time,
         d.HFpEF_all_time,
+        d.HF_all_time,
         d.ascvd_latest_date_all_time,
         d.ckd_latest_date_all_time,
         d.ckd3_4_latest_date_all_time,
         d.ami_t1_latest_date_all_time,
         d.mi_latest_date_all_time,
         d.HFpEF_latest_date_all_time,
+        d.HF_latest_date_all_time,
 
         d.ascvd_current,
         d.ckd_current,
@@ -126,24 +173,24 @@ patient_master_data AS (
         d.ami_t1_current,
         d.mi_current,
         d.HFpEF_current,
+        d.HF_current,
         d.ascvd_latest_date_current,
         d.ckd_latest_date_current,
         d.ckd3_4_latest_date_current,
         d.ami_t1_latest_date_current,
         d.mi_latest_date_current,
-        d.HFpEF_latest_date_current
-
+        d.HFpEF_latest_date_current,
+        d.HF_latest_date_current
     FROM
         diagnosis_flags d
-        LEFT JOIN S_LAAD_CONS_PATIENT_DEMOGRAPHICS_EXP s ON d.patient_id = s.patient_id
+        LEFT JOIN "LAAD_PROD"."RPT_LAAD"."S_LAAD_CONS_PATIENT_DEMOGRAPHICS_EXP" s ON d.patient_id = s.patient_id
 )
-
 -- Generate final master data table with two rows per patient
 SELECT
     'ALL TIME' AS time_period,
     pmd.patient_id,
     pmd.age,
-    pmd.PATIENT_GENDER,
+    pmd.gender,
     pmd.access_to_medication,
     pmd.food_insecurity,
     pmd.access_to_care,
@@ -157,7 +204,7 @@ SELECT
     pmd.ami_t1_all_time AS ami_t1,
     pmd.mi_all_time AS mi,
     pmd.HFpEF_all_time AS HFpEF,
-
+    pmd.HF_all_time AS HF,
     -- Include latest diagnostic dates
     pmd.ascvd_latest_date_all_time AS ascvd_latest_date,
     pmd.ckd_latest_date_all_time AS ckd_latest_date,
@@ -165,10 +212,10 @@ SELECT
     pmd.ami_t1_latest_date_all_time AS ami_t1_latest_date,
     pmd.mi_latest_date_all_time AS mi_latest_date,
     pmd.HFpEF_latest_date_all_time AS HFpEF_latest_date,
-
-    CASE WHEN pmd.ascvd_all_time = 1 AND pmd.ckd3_4_all_time = 1 THEN 1 ELSE 0 END AS Z_flag,
-    CASE WHEN pmd.HFpEF_all_time = 1 THEN 1 ELSE 0 END AS H_flag,
-    CASE WHEN pmd.ami_t1_all_time = 1 THEN 1 ELSE 0 END AS A_flag
+    pmd.HF_latest_date_all_time AS HF_latest_date,
+    CASE WHEN pmd.ascvd_all_time = 1 AND pmd.ckd3_4_all_time = 1 THEN 1 ELSE 0 END AS zeus_flag,
+    CASE WHEN pmd.HFpEF_all_time = 1 THEN 1 ELSE 0 END AS hermes_flag,
+    CASE WHEN pmd.ami_t1_all_time = 1 THEN 1 ELSE 0 END AS artemis_flag
 FROM
     patient_master_data pmd
 
@@ -178,7 +225,7 @@ SELECT
     'CURRENT(12MONTH)' AS time_period,
     pmd.patient_id,
     pmd.age,
-    pmd.PATIENT_GENDER,
+    pmd.gender,
     pmd.access_to_medication,
     pmd.food_insecurity,
     pmd.access_to_care,
@@ -188,11 +235,11 @@ SELECT
     pmd.education,
     pmd.ascvd_current AS ascvd,
     pmd.ckd_current AS ckd,
-    pmd.ckd3_4_current AS ckd3_4,
+    pmd.ckd3_4_current AS ckd3_4, 
     pmd.ami_t1_current AS ami_t1,
     pmd.mi_current AS mi,
     pmd.HFpEF_current AS HFpEF,
-
+    pmd.HF_current AS HF,
     -- Include latest diagnostic dates
     pmd.ascvd_latest_date_current AS ascvd_latest_date,
     pmd.ckd_latest_date_current AS ckd_latest_date,
@@ -200,9 +247,9 @@ SELECT
     pmd.ami_t1_latest_date_current AS ami_t1_latest_date,
     pmd.mi_latest_date_current AS mi_latest_date,
     pmd.HFpEF_latest_date_current AS HFpEF_latest_date,
-
-    CASE WHEN pmd.ascvd_current = 1 AND pmd.ckd3_4_current = 1 THEN 1 ELSE 0 END AS Z_flag,
-    CASE WHEN pmd.HFpEF_current = 1 THEN 1 ELSE 0 END AS H_flag,
-    CASE WHEN pmd.ami_t1_current = 1 THEN 1 ELSE 0 END AS A_flag
+    pmd.HF_latest_date_current AS HF_latest_date,
+    CASE WHEN pmd.ascvd_current = 1 AND pmd.ckd3_4_current = 1 THEN 1 ELSE 0 END AS zeus_flag,
+    CASE WHEN pmd.HFpEF_current = 1 THEN 1 ELSE 0 END AS hermes_flag,
+    CASE WHEN pmd.ami_t1_current = 1 THEN 1 ELSE 0 END AS artemis_flag
 FROM
     patient_master_data pmd;
