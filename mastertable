@@ -1,12 +1,3 @@
-Below is a query to pull a patient master table from LAAD data for a dashboard project for cardio renal domain. 
-We want to change the plan and want to revise the master table layout, rather than make it a patient level data, we want to keep the data to claim level, for each claim, we will have the DX code, so we can find out the DX flags like what we did in the existing query, and we can find the correspoinding rendering HCPS and their specialties. In this new layout case, we can invovle analysis of HCPs.
-Due to the data volume concern, we limit the new master table to only the paitient cohort in the CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10 scope as we did in the previous query.
-As I mentioned, for HCPs related field, we will include 'NNI_RENDERING_PR_SPEC_GROUP' for the group and  'NNI_RENDERING_PR_SPEC_NAME' for the individual specality, NNI_RENDERING_CUSTOMER_ID is the id of HCPS, 'zip' as their zip_code and 'state' as their statelevel location.
-We are going to remove the filter of 'time_period', but we will leverage the 'service_date' of each claim, so we can create the similar filter on tableau side easily(rather than built it into the master table). for each row, we still maintain all the patients' characteristics, the patients information as the way joined in below query. We want to keep making the patient's DX flag based on each claim's diagnosis code(as we are on claim level)
-We want to aggregate and generate a field, which I consider is the tricky part of this new query. For each row, we want to have a "total Dx grouping flag" associate with the patient, to locate the qualified dx flags via patient's all time history in the table. And qualified Dx will be seperated by commas so we can parse them out on tableau. example field value, for a patient ever diagnosed ASCVD, CKD, CKD34, MI. The field value is "ASCVD, CKD, CKD34, MI"
-
-Please consider the computational efficiency when design the query, make clear notes to the code so we can understand. I think most of the logic can be learnt from the below query, especially the relationship between DX and ICD10 code list.
-
 -- Set session timeout and use the appropriate database and schema
 ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 144000;
 USE DATABASE "AANALYTICS_PROD";
@@ -23,43 +14,43 @@ SET START_DATE = (
 );
 
 -- Create the claim-level master table
-CREATE TABLE Project_Odyssey_Master_Claim_Level_11222024 AS
+CREATE TABLE Project_Odyssey_Master_Claim_Level AS
 
--- Step 1: Prepare diagnosis code lists
+-- Step 1: Prepare diagnosis code lists for the cohort
 WITH
 ASCVD_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE ASCVD = 'Y'
 ),
 CKD_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE CKD = 'Y'
 ),
 CKD_3_4_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE "CKD3&4" = 'Y'
 ),
 MI_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE MI = 'Y'
 ),
 AMI_T1_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE "AMI Type 1" = 'Y'
 ),
 HF_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE "Heart Failure" = 'Y'
 ),
 HFpEF_CODE AS (
   SELECT DIAG_CD
-  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_COHORT_ICD10"
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
   WHERE "HFpEF" = 'Y'
 ),
 -- Combine all diagnosis codes into one list
@@ -79,139 +70,135 @@ ALL_CODES AS (
   SELECT DIAG_CD FROM HFpEF_CODE
 ),
 
--- Step 2: Identify the patient cohort based on diagnosis codes
+-- Step 2: Identify the patient cohort based on diagnosis codes in ALL_CODES
 patient_cohort AS (
-  SELECT DISTINCT patient_id
-  FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX"
-  WHERE diagnosis_code IN (SELECT DIAG_CD FROM ALL_CODES)
+    SELECT DISTINCT patient_id
+    FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX"
+    WHERE diagnosis_code IN (SELECT DIAG_CD FROM ALL_CODES)
 ),
 
--- Step 3: Retrieve relevant claims data including HCP information and per-claim diagnosis flags
+-- Step 3: Retrieve relevant claims data including HCP information
 relevant_claims AS (
-  SELECT
-    c.patient_id,
-    c.claim_id,
-    c.diagnosis_code,
-    c.SERVICE_DATE,
-    c.PATIENT_BIRTH_YEAR,
-    c.PATIENT_GENDER,
-    c.NNI_RENDERING_PR_SPEC_GROUP,
-    c.NNI_RENDERING_PR_SPEC_NAME,
-    c.RENDERING_CUSTOMER_ID,
-    c.zip,
-    c.state,
-    -- Per-claim diagnosis flags
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM ASCVD_CODE) THEN 1 ELSE 0 END AS ascvd_flag,
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM CKD_CODE) THEN 1 ELSE 0 END AS ckd_flag,
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM CKD_3_4_CODE) THEN 1 ELSE 0 END AS ckd34_flag,
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM MI_CODE) THEN 1 ELSE 0 END AS mi_flag,
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM AMI_T1_CODE) THEN 1 ELSE 0 END AS ami_t1_flag,
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM HF_CODE) THEN 1 ELSE 0 END AS hf_flag,
-    CASE WHEN c.diagnosis_code IN (SELECT DIAG_CD FROM HFpEF_CODE) THEN 1 ELSE 0 END AS hfpef_flag
-  FROM
-    "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX" c
-  WHERE
-    c.patient_id IN (SELECT patient_id FROM patient_cohort)
-    AND c.diagnosis_code IN (SELECT DIAG_CD FROM ALL_CODES)
+    SELECT
+        c.patient_id,
+        c.claim_id,
+        c.diagnosis_code,
+        c.SERVICE_DATE,
+        c.PATIENT_BIRTH_YEAR,
+        c.PATIENT_GENDER,
+        c.NNI_RENDERING_PR_SPEC_GROUP,
+        c.NNI_RENDERING_PR_SPEC_NAME,
+        c.NNI_RENDERING_CUSTOMER_ID,
+        c.RENDERING_PROVIDER_ZIP AS zip,
+        c.RENDERING_PROVIDER_STATE AS state
+    FROM
+        "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX" c
+    WHERE
+        c.patient_id IN (SELECT patient_id FROM patient_cohort)
 ),
 
--- Step 4: Calculate diagnosis flags for each patient based on all-time history
-patient_diagnosis_flags AS (
-  SELECT
-    patient_id,
-    -- Assign flags if patient has ever had the diagnosis
-    MAX(CASE WHEN ascvd_flag = 1 THEN 'ASCVD' END) AS ascvd_flag,
-    MAX(CASE WHEN ckd_flag = 1 THEN 'CKD' END) AS ckd_flag,
-    MAX(CASE WHEN ckd34_flag = 1 THEN 'CKD34' END) AS ckd34_flag,
-    MAX(CASE WHEN mi_flag = 1 THEN 'MI' END) AS mi_flag,
-    MAX(CASE WHEN ami_t1_flag = 1 THEN 'AMI_T1' END) AS ami_t1_flag,
-    MAX(CASE WHEN hf_flag = 1 THEN 'HF' END) AS hf_flag,
-    MAX(CASE WHEN hfpef_flag = 1 THEN 'HFpEF' END) AS hfpef_flag
-  FROM
-    relevant_claims
-  GROUP BY
-    patient_id
+-- Step 4: Load the broader diagnosis grouping reference table
+DX_GROUPING AS (
+    SELECT
+        DIAG_CD,
+        Name AS grouping_name
+    FROM
+        "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_ICD_GROUPING_FLAGS_TOTAL_112620244"
 ),
 
--- Step 5: Create a total diagnosis grouping flag by concatenating individual flags
+-- Step 5: Join relevant claims with DX_GROUPING to get grouping names
+claims_with_groupings AS (
+    SELECT
+        rc.*,
+        dg.grouping_name
+    FROM
+        relevant_claims rc
+        LEFT JOIN DX_GROUPING dg ON rc.diagnosis_code = dg.DIAG_CD
+),
+
+-- Step 6: For each patient, collect unique grouping names into Total_Dx_GROUPING_FLAG
 patient_diagnosis_list AS (
-  SELECT
-    patient_id,
-    -- Concatenate non-null flags separated by commas
-    CONCAT_WS(', ',
-      ascvd_flag,
-      ckd_flag,
-      ckd34_flag,
-      mi_flag,
-      ami_t1_flag,
-      hf_flag,
-      hfpef_flag
-    ) AS total_dx_grouping_flag
-  FROM
-    patient_diagnosis_flags
+    SELECT
+        patient_id,
+        LISTAGG(DISTINCT grouping_name, ', ') AS total_dx_grouping_flag
+    FROM
+        claims_with_groupings
+    WHERE
+        grouping_name IS NOT NULL  -- Exclude null grouping names
+    GROUP BY
+        patient_id
 ),
 
--- Step 6: Retrieve patient demographic information
+-- Step 7: Retrieve patient demographic information
 patient_demographics AS (
-  SELECT
-    s.patient_id,
-    s.Access_To_Medication_Score_1 AS access_to_medication,
-    s.Food_Insecurity_Score_1 AS food_insecurity,
-    s.Access_To_Care_Score_1 AS access_to_care,
-    s.Housing_Instability_Score_1 AS housing_instability,
-    s.Sdoh_Total_1 AS total_risk,
-    s.ethnic_ind AS ethnicity,
-    s.EDUC_ind AS education
-  FROM
-    "LAAD_PROD"."RPT_LAAD"."S_LAAD_CONS_PATIENT_DEMOGRAPHICS_EXP" s
-  WHERE
-    s.patient_id IN (SELECT patient_id FROM patient_cohort)
+    SELECT
+        s.patient_id,
+        s.Access_To_Medication_Score_1 AS access_to_medication,
+        s.Food_Insecurity_Score_1 AS food_insecurity,
+        s.Access_To_Care_Score_1 AS access_to_care,
+        s.Housing_Instability_Score_1 AS housing_instability,
+        s.Sdoh_Total_1 AS total_risk,
+        s.ethnic_ind AS ethnicity,
+        s.EDUC_ind AS education
+    FROM
+        "LAAD_PROD"."RPT_LAAD"."S_LAAD_CONS_PATIENT_DEMOGRAPHICS_EXP" s
+    WHERE
+        s.patient_id IN (SELECT patient_id FROM patient_cohort)
 ),
 
--- Step 7: Combine claims data with patient diagnosis flags and demographics
+-- Step 8: Retrieve HCP affiliation information
+hcp_affiliations AS (
+    SELECT
+        customer_id,
+        -- Include necessary fields from the HCP affiliation table
+        affiliation_field1,
+        affiliation_field2
+    FROM
+        "AANALYTICS_PROD"."WORKSPACE"."PROJECT_ODYSSEY_HCP_AFFILIATION_11262024"
+),
+
+-- Step 9: Combine claims data with grouping names, demographics, and HCP affiliation
 claim_master_data AS (
-  SELECT
-    rc.patient_id,
-    rc.claim_id,
-    rc.diagnosis_code,
-    rc.SERVICE_DATE,
-    rc.PATIENT_BIRTH_YEAR AS birth_year,
-    rc.PATIENT_GENDER AS gender,
-    rc.NNI_RENDERING_PR_SPEC_GROUP,
-    rc.NNI_RENDERING_PR_SPEC_NAME,
-    rc.RENDERING_CUSTOMER_ID,
-    rc.zip,
-    rc.state,
-    rc.ascvd_flag AS claim_ascvd_flag,
-    rc.ckd_flag AS claim_ckd_flag,
-    rc.ckd34_flag AS claim_ckd34_flag,
-    rc.mi_flag AS claim_mi_flag,
-    rc.ami_t1_flag AS claim_ami_t1_flag,
-    rc.hf_flag AS claim_hf_flag,
-    rc.hfpef_flag AS claim_hfpef_flag,
-    pd.access_to_medication,
-    pd.food_insecurity,
-    pd.access_to_care,
-    pd.housing_instability,
-    pd.total_risk,
-    pd.ethnicity,
-    pd.education,
-    pdl.total_dx_grouping_flag
-  FROM
-    relevant_claims rc
-    LEFT JOIN patient_demographics pd ON rc.patient_id = pd.patient_id
-    LEFT JOIN patient_diagnosis_list pdl ON rc.patient_id = pdl.patient_id
+    SELECT
+        cwg.patient_id,
+        cwg.claim_id,
+        cwg.diagnosis_code,
+        cwg.SERVICE_DATE,
+        cwg.PATIENT_BIRTH_YEAR AS birth_year,
+        cwg.PATIENT_GENDER AS gender,
+        cwg.NNI_RENDERING_PR_SPEC_GROUP,
+        cwg.NNI_RENDERING_PR_SPEC_NAME,
+        cwg.NNI_RENDERING_CUSTOMER_ID,
+        cwg.zip,
+        cwg.state,
+        cwg.grouping_name AS claim_grouping_name,
+        pd.access_to_medication,
+        pd.food_insecurity,
+        pd.access_to_care,
+        pd.housing_instability,
+        pd.total_risk,
+        pd.ethnicity,
+        pd.education,
+        pdl.total_dx_grouping_flag,
+        hcp.affiliation_field1,
+        hcp.affiliation_field2,
+        -- Per-claim diagnosis flags based on original code lists
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM ASCVD_CODE) THEN 1 ELSE 0 END AS claim_ascvd_flag,
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM CKD_CODE) THEN 1 ELSE 0 END AS claim_ckd_flag,
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM CKD_3_4_CODE) THEN 1 ELSE 0 END AS claim_ckd34_flag,
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM MI_CODE) THEN 1 ELSE 0 END AS claim_mi_flag,
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM AMI_T1_CODE) THEN 1 ELSE 0 END AS claim_ami_t1_flag,
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM HF_CODE) THEN 1 ELSE 0 END AS claim_hf_flag,
+        CASE WHEN cwg.diagnosis_code IN (SELECT DIAG_CD FROM HFpEF_CODE) THEN 1 ELSE 0 END AS claim_hfpef_flag
+    FROM
+        claims_with_groupings cwg
+        LEFT JOIN patient_demographics pd ON cwg.patient_id = pd.patient_id
+        LEFT JOIN patient_diagnosis_list pdl ON cwg.patient_id = pdl.patient_id
+        LEFT JOIN hcp_affiliations hcp ON cwg.NNI_RENDERING_CUSTOMER_ID = hcp.customer_id
 )
 
 -- Final Step: Select all data from the combined dataset
 SELECT
-  *
+    *
 FROM
-  claim_master_data; 
-
-
-AANALYTICS_PROD.WORKSPACE.CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_ICD_GROUPING_FLAGS_TOTAL_112620244;
-
-AANALYTICS_PROD.WORKSPACE.CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10;
-
-AANALYTICS_PROD.WORKSPACE.PROJECT_ODYSSEY_HCP_AFFILIATION_11262024;
+    claim_master_data;
