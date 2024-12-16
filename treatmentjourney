@@ -1,0 +1,87 @@
+Table 1: "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CV_RX" 
+Relevant Field names: 
+Patient_ID
+Claim_ID
+Service_Date
+Om_Product_Therapeutic_Class
+Om_Product_Therapeutic_Sub_Class
+Om_Product_Brand
+Claim_Type = "PD" (required filter)
+Source_of_Business
+
+Table 2: "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX"
+Relevant Field names: 
+Patient_ID
+Claim_ID
+Service_Date (Filter Min Service Date >=2018)
+Diagnosis_Code
+Diagnosis_Description
+Datasource_ID (This represent if the claim is coming from a Hospital (Hx) or Outpatient (Mx))
+
+We are trying to generate a data table for the belowing format, and including the source of buisness and datasource_id. The line of threpy meaning the order of that patient got prescribed of certain treatment(Theraputic Sub-class, Theraputic class, and Om_Product_Brand), if the patient got prescribed multiple treatments in the same service_date, then the items shall be included as same line and seperate with commas.
+
+
+			Brand 					Theraputic Sub-class					Theraputic Class				
+Patient ID	Start Dignoses	TA	Line of Therpy 1	Line of Therpy 2	Line of Therpy 3	Line of Therpy 4	Line of Therpy 5	Line of Therpy 1	Line of Therpy 2	Line of Therpy 3	Line of Therpy 4	Line of Therpy 5	Line of Therpy 1	Line of Therpy 2	Line of Therpy 3	Line of Therpy 4	Line of Therpy 5
+123	1/2/2018	ASCVD	Product 1, Product 2					Beta blockers					Beta blockers				
+123	3/2/2/24	Heart Failure															
+123	2/24/2022	AMI		
+
+The TAs can be filtered and generated using below CTE. We do not need CKD_3_4 and AMI_T1_code in this case
+
+
+-- Step 1: Prepare diagnosis code lists for the cohort
+WITH
+ASCVD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE ASCVD = 'Y'
+),
+CKD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE CKD = 'Y'
+),
+CKD_3_4_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "CKD3&4" = 'Y'
+),
+MI_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE MI = 'Y'
+),
+AMI_T1_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "AMI Type 1" = 'Y'
+),
+HF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "Heart Failure" = 'Y'
+),
+HFpEF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "HFpEF" = 'Y'
+),
+-- Combine all diagnosis codes into one list
+ALL_CODES AS (
+  SELECT DIAG_CD FROM ASCVD_CODE
+  UNION
+  SELECT DIAG_CD FROM CKD_CODE
+  UNION
+  SELECT DIAG_CD FROM CKD_3_4_CODE
+  UNION
+  SELECT DIAG_CD FROM MI_CODE
+  UNION
+  SELECT DIAG_CD FROM AMI_T1_CODE
+  UNION
+  SELECT DIAG_CD FROM HF_CODE
+  UNION
+  SELECT DIAG_CD FROM HFpEF_CODE
+)
+
+
