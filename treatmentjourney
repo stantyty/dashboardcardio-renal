@@ -85,3 +85,240 @@ ALL_CODES AS (
 )
 
 
+
+
+ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 144000;
+USE DATABASE "AANALYTICS_PROD";
+USE SCHEMA "WORKSPACE";
+
+WITH
+-- Step 1: Define code sets for each TA
+ASCVD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE ASCVD = 'Y'
+),
+CKD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE CKD = 'Y'
+),
+MI_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE MI = 'Y'
+),
+HF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "Heart Failure" = 'Y'
+),
+HFpEF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "HFpEF" = 'Y'
+),
+ALL_CODES AS (
+  SELECT DIAG_CD, 'ASCVD' AS TA FROM ASCVD_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'CKD' AS TA FROM CKD_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'MI' AS TA FROM MI_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'Heart Failure' AS TA FROM HF_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'HFpEF' AS TA FROM HFpEF_CODE
+),
+
+-- Step 2: Filter diagnosis claims (≥2018) and map to TAs
+diagnosis_data AS (
+  SELECT 
+    d.Patient_ID,
+    d.Claim_ID,
+    d.Service_Date,
+    d.Diagnosis_Code,
+    a.TA
+  FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX" d
+  JOIN ALL_CODES a ON d.Diagnosis_Code = a.DIAG_CD
+  WHERE d.Service_Date >= DATE '2018-01-01'
+),
+
+-- Step 3: For each patient and TA, find the earliest diagnosis date
+patient_ta_start AS (
+  SELECT
+    Patient_ID,
+    TA,
+    MIN(Service_Date) AS Start_Diagnosis_Date
+  FROM diagnosis_data
+  GROUP BY Patient_ID, TA
+),
+
+-- Step 4: Retrieve Rx claims with Claim_Type='PD' on or after Start_Diagnosis_Date
+rx_data AS (
+  SELECT
+    r.Patient_ID,
+    pts.TA,
+    r.Service_Date,
+    r.Om_Product_Therapeutic_Class,
+    r.Om_Product_Therapeutic_Sub_Class,
+    r.Om_Product_Brand,
+    r.Source_of_Business
+  FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CV_RX" r
+  JOIN patient_ta_start pts ON r.Patient_ID = pts.Patient_ID
+  WHERE r.Claim_Type = 'PD'
+    AND r.Service_Date >= pts.Start_Diagnosis_Date
+),
+
+-- Step 5: Derive line_of_therapy for each category separately
+
+-- 5a: Brand Lines
+brand_lines AS (
+  SELECT
+    Patient_ID,
+    TA,
+    Service_Date,
+    LISTAGG(DISTINCT Om_Product_Brand, ', ') AS line_brands,
+    LISTAGG(DISTINCT Source_of_Business, ', ') AS line_brand_sources
+  FROM rx_data
+  GROUP BY Patient_ID, TA, Service_Date
+),
+brand_ranked AS (
+  SELECT
+    bl.*,
+    DENSE_RANK() OVER(PARTITION BY bl.Patient_ID, bl.TA ORDER BY bl.Service_Date) AS brand_line_num
+  FROM brand_lines bl
+),
+brand_pivot AS (
+  SELECT
+    Patient_ID,
+    TA,
+    MAX(CASE WHEN brand_line_num=1 THEN line_brands END) AS brand_line_1,
+    MAX(CASE WHEN brand_line_num=2 THEN line_brands END) AS brand_line_2,
+    MAX(CASE WHEN brand_line_num=3 THEN line_brands END) AS brand_line_3,
+    MAX(CASE WHEN brand_line_num=4 THEN line_brands END) AS brand_line_4,
+    MAX(CASE WHEN brand_line_num=5 THEN line_brands END) AS brand_line_5,
+
+    MAX(CASE WHEN brand_line_num=1 THEN line_brand_sources END) AS brand_line_1_sources,
+    MAX(CASE WHEN brand_line_num=2 THEN line_brand_sources END) AS brand_line_2_sources,
+    MAX(CASE WHEN brand_line_num=3 THEN line_brand_sources END) AS brand_line_3_sources,
+    MAX(CASE WHEN brand_line_num=4 THEN line_brand_sources END) AS brand_line_4_sources,
+    MAX(CASE WHEN brand_line_num=5 THEN line_brand_sources END) AS brand_line_5_sources
+  FROM brand_ranked
+  GROUP BY Patient_ID, TA
+),
+
+-- 5b: Sub-Class Lines
+subclass_lines AS (
+  SELECT
+    Patient_ID,
+    TA,
+    Service_Date,
+    LISTAGG(DISTINCT Om_Product_Therapeutic_Sub_Class, ', ') AS line_sub_classes,
+    LISTAGG(DISTINCT Source_of_Business, ', ') AS line_subclass_sources
+  FROM rx_data
+  GROUP BY Patient_ID, TA, Service_Date
+),
+subclass_ranked AS (
+  SELECT
+    sl.*,
+    DENSE_RANK() OVER(PARTITION BY sl.Patient_ID, sl.TA ORDER BY sl.Service_Date) AS subclass_line_num
+  FROM subclass_lines sl
+),
+subclass_pivot AS (
+  SELECT
+    Patient_ID,
+    TA,
+    MAX(CASE WHEN subclass_line_num=1 THEN line_sub_classes END) AS subclass_line_1,
+    MAX(CASE WHEN subclass_line_num=2 THEN line_sub_classes END) AS subclass_line_2,
+    MAX(CASE WHEN subclass_line_num=3 THEN line_sub_classes END) AS subclass_line_3,
+    MAX(CASE WHEN subclass_line_num=4 THEN line_sub_classes END) AS subclass_line_4,
+    MAX(CASE WHEN subclass_line_num=5 THEN line_sub_classes END) AS subclass_line_5,
+
+    MAX(CASE WHEN subclass_line_num=1 THEN line_subclass_sources END) AS subclass_line_1_sources,
+    MAX(CASE WHEN subclass_line_num=2 THEN line_subclass_sources END) AS subclass_line_2_sources,
+    MAX(CASE WHEN subclass_line_num=3 THEN line_subclass_sources END) AS subclass_line_3_sources,
+    MAX(CASE WHEN subclass_line_num=4 THEN line_subclass_sources END) AS subclass_line_4_sources,
+    MAX(CASE WHEN subclass_line_num=5 THEN line_subclass_sources END) AS subclass_line_5_sources
+  FROM subclass_ranked
+  GROUP BY Patient_ID, TA
+),
+
+-- 5c: Class Lines
+class_lines AS (
+  SELECT
+    Patient_ID,
+    TA,
+    Service_Date,
+    LISTAGG(DISTINCT Om_Product_Therapeutic_Class, ', ') AS line_classes,
+    LISTAGG(DISTINCT Source_of_Business, ', ') AS line_class_sources
+  FROM rx_data
+  GROUP BY Patient_ID, TA, Service_Date
+),
+class_ranked AS (
+  SELECT
+    cl.*,
+    DENSE_RANK() OVER(PARTITION BY cl.Patient_ID, cl.TA ORDER BY cl.Service_Date) AS class_line_num
+  FROM class_lines cl
+),
+class_pivot AS (
+  SELECT
+    Patient_ID,
+    TA,
+    MAX(CASE WHEN class_line_num=1 THEN line_classes END) AS class_line_1,
+    MAX(CASE WHEN class_line_num=2 THEN line_classes END) AS class_line_2,
+    MAX(CASE WHEN class_line_num=3 THEN line_classes END) AS class_line_3,
+    MAX(CASE WHEN class_line_num=4 THEN line_classes END) AS class_line_4,
+    MAX(CASE WHEN class_line_num=5 THEN line_classes END) AS class_line_5,
+
+    MAX(CASE WHEN class_line_num=1 THEN line_class_sources END) AS class_line_1_sources,
+    MAX(CASE WHEN class_line_num=2 THEN line_class_sources END) AS class_line_2_sources,
+    MAX(CASE WHEN class_line_num=3 THEN line_class_sources END) AS class_line_3_sources,
+    MAX(CASE WHEN class_line_num=4 THEN line_class_sources END) AS class_line_4_sources,
+    MAX(CASE WHEN class_line_num=5 THEN line_class_sources END) AS class_line_5_sources
+  FROM class_ranked
+  GROUP BY Patient_ID, TA
+)
+
+-- Step 6: Combine everything with the start diagnosis date
+SELECT
+  pts.Patient_ID,
+  pts.Start_Diagnosis_Date,
+  pts.TA,
+  bp.brand_line_1,
+  bp.brand_line_2,
+  bp.brand_line_3,
+  bp.brand_line_4,
+  bp.brand_line_5,
+  bp.brand_line_1_sources,
+  bp.brand_line_2_sources,
+  bp.brand_line_3_sources,
+  bp.brand_line_4_sources,
+  bp.brand_line_5_sources,
+
+  sp.subclass_line_1,
+  sp.subclass_line_2,
+  sp.subclass_line_3,
+  sp.subclass_line_4,
+  sp.subclass_line_5,
+  sp.subclass_line_1_sources,
+  sp.subclass_line_2_sources,
+  sp.subclass_line_3_sources,
+  sp.subclass_line_4_sources,
+  sp.subclass_line_5_sources,
+
+  cp.class_line_1,
+  cp.class_line_2,
+  cp.class_line_3,
+  cp.class_line_4,
+  cp.class_line_5,
+  cp.class_line_1_sources,
+  cp.class_line_2_sources,
+  cp.class_line_3_sources,
+  cp.class_line_4_sources,
+  cp.class_line_5_sources
+FROM patient_ta_start pts
+LEFT JOIN brand_pivot bp ON pts.Patient_ID = bp.Patient_ID AND pts.TA = bp.TA
+LEFT JOIN subclass_pivot sp ON pts.Patient_ID = sp.Patient_ID AND pts.TA = sp.TA
+LEFT JOIN class_pivot cp ON pts.Patient_ID = cp.Patient_ID AND pts.TA = cp.TA;
+
+
