@@ -322,3 +322,27 @@ LEFT JOIN subclass_pivot sp ON pts.Patient_ID = sp.Patient_ID AND pts.TA = sp.TA
 LEFT JOIN class_pivot cp ON pts.Patient_ID = cp.Patient_ID AND pts.TA = cp.TA;
 
 
+Now we want to restructure the table and introduce more filters, avoid missing filters, I'll list all filters:
+1. Only include patients whose CV Rx date is later than their first corresponding TA Diagnosis date(TA range is ASCVD, CKD, MI, HF, HFePF: RX> DX date
+2. In addition to #1, only include the patients that: for the date diff between Rx Date and Dx Date, date difference should be <=90 days
+3. Only look at the claims within 1 year after their first CV Rx (look forward 1 year). So only include claims for a patient that is within 1 year of this patient's first CV Rx for the corresponding TA.
+4. Only consider Paid claims only:Claim Type = 'PD'
+5. Only include record that Source of Business != 'C'
+
+Query/Table structure Changes:
+1. now introduce one new field to the resuting table:Treatment_Granularity_Level. The values will be "Om_Product_Therapeutic_Class", "Om_Product_Therapeutic_Sub_Class" or "Om_Product_Brand". So for one each patient, we can have three rows of line#1 - line# 5 treatment, but for three different levels. This can avoid making the table wider and easy to implement on tableau.
+2. Again, each line of treatments(for three levels), we may have multiple treatment within the same service date, in that case, we sort these multiple Line of Treatments by athebathical sort, and seperate using commas to put into one cell.
+3. As we added a one year look ahead filter, please add a field of the date one Year look forward(1 year + first cv rx date for that TA) into the resulting table for verfication purposes. Please suggest a field name and name it.
+
+So to clarify, in the updated table, one patient could have up to 15 rows(3 levels of treatment granularities times 5 TAs = 15, if applicable, not all patients will associate with 5 TAs). The final fields we should have are:
+Patient Id,	Min CV Rx Date,	Min_Service_Date, Date one year look forward,	TA,	Treatment_Granularity_Level,	Line # 1,	Line#2,	Line#3,	Line #4, 	Line #5
+
+Rename these fields and make it easy to understand for professionals.
+
+Now, go ahead to generate the updated query. 
+
+
+
+
+
+
