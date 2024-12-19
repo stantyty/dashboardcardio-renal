@@ -676,4 +676,343 @@ Based on this, we need to have some updates to the query:
 
 
 
+ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 144000;
+USE DATABASE "AANALYTICS_PROD";
+USE SCHEMA "WORKSPACE";
+
+-- ****************************************************
+-- Set a variable for the latest service date to ensure 1-year window feasibility
+-- Here we assume that LATEST_SERVICE_DATE is defined as the maximum service_date in the data.
+-- ****************************************************
+SET LATEST_SERVICE_DATE = (
+    SELECT LAST_DAY(MAX(SERVICE_DATE), 'month') 
+    FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX"
+);
+
+-- ****************************************************
+-- Step 1: Define TA code sets and identify earliest TA diagnosis date per patient-TA
+-- Only consider diagnoses on or after 2018-01-01 as per instructions.
+-- ****************************************************
+WITH ASCVD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE ASCVD = 'Y'
+),
+CKD_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE CKD = 'Y'
+),
+MI_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE MI = 'Y'
+),
+HF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "Heart Failure" = 'Y'
+),
+HFpEF_CODE AS (
+  SELECT DIAG_CD
+  FROM "AANALYTICS_PROD"."WORKSPACE"."CIA_CARDIORENALDASHBOARD_DE_PROJECT_ODYSSEY_COHORT_ICD10"
+  WHERE "HFpEF" = 'Y'
+),
+ALL_CODES AS (
+  SELECT DIAG_CD, 'ASCVD' AS TA FROM ASCVD_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'CKD' AS TA FROM CKD_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'MI' AS TA FROM MI_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'Heart Failure' AS TA FROM HF_CODE
+  UNION ALL
+  SELECT DIAG_CD, 'HFpEF' AS TA FROM HFpEF_CODE
+),
+
+diagnosis_data AS (
+  SELECT 
+    d.Patient_ID,
+    d.Service_Date,
+    a.TA
+  FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX" d
+  JOIN ALL_CODES a ON d.Diagnosis_Code = a.DIAG_CD
+  WHERE d.Service_Date >= DATE '2018-01-01' -- Only include diagnoses after 2018-01-01
+),
+
+patient_ta_diag_start AS (
+  SELECT
+    Patient_ID,
+    TA,
+    MIN(Service_Date) AS FIRST_TA_DIAGNOSIS_DATE
+  FROM diagnosis_data
+  GROUP BY Patient_ID, TA
+),
+
+-- ****************************************************
+-- Step 2: Earliest Rx date at patient level (not per TA)
+-- Conditions:
+--   - Claim_Type='PD'
+--   - Source_of_Business!='C'
+--   - Rx date must be > earliest TA diagnosis date and within 90 days of that earliest TA diag date for at least one TA.
+-- We will find all Rx claims that meet these conditions for any TA, then pick the earliest Rx date per patient.
+-- ****************************************************
+-- First, gather all (patient, TA) pairs with valid earliest TA diag dates:
+valid_ta AS (
+  SELECT * 
+  FROM patient_ta_diag_start
+),
+
+-- Get all Rx that meets conditions for ANY TA:
+rx_candidates AS (
+  SELECT DISTINCT
+    r.Patient_ID,
+    r.Service_Date AS Rx_Date,
+    r.Om_Product_Therapeutic_Class,
+    r.Om_Product_Therapeutic_Sub_Class,
+    r.Om_Product_Brand,
+    r.Source_of_Business,
+    vta.TA,
+    vta.FIRST_TA_DIAGNOSIS_DATE
+  FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CV_RX" r
+  JOIN valid_ta vta ON r.Patient_ID = vta.Patient_ID
+  WHERE r.Claim_Type = 'PD'
+    AND r.Source_of_Business != 'C'
+    AND r.Service_Date > vta.FIRST_TA_DIAGNOSIS_DATE
+    AND DATEDIFF('day', vta.FIRST_TA_DIAGNOSIS_DATE, r.Service_Date) <= 90
+),
+
+-- Earliest Rx date per patient that satisfies any TA condition:
+patient_earliest_rx AS (
+  SELECT
+    Patient_ID,
+    MIN(Rx_Date) AS FIRST_CV_RX_DATE_PATIENT
+  FROM rx_candidates
+  GROUP BY Patient_ID
+),
+
+-- ****************************************************
+-- Step 3: 1-year look forward feasibility
+-- Only include patients whose FIRST_CV_RX_DATE_PATIENT <= LATEST_SERVICE_DATE - 1 year
+-- This ensures we have a full 1-year window of data after their earliest Rx date.
+-- ****************************************************
+filtered_patients AS (
+  SELECT
+    per.Patient_ID,
+    per.FIRST_CV_RX_DATE_PATIENT
+  FROM patient_earliest_rx per
+  WHERE per.FIRST_CV_RX_DATE_PATIENT <= DATEADD(year, -1, $LATEST_SERVICE_DATE)
+),
+
+-- ****************************************************
+-- Step 4: Now filter the TA list to only those patients who are in filtered_patients
+-- and keep only those TAs where FIRST_TA_DIAGNOSIS_DATE >= 2018-01-01 (already ensured)
+-- Actually, we've ensured that in the initial diagnosis_data step. All are after 2018-01-01.
+-- Just ensure the patient is in filtered_patients.
+-- ****************************************************
+final_ta_list AS (
+  SELECT
+    ptds.Patient_ID,
+    ptds.TA,
+    ptds.FIRST_TA_DIAGNOSIS_DATE
+  FROM patient_ta_diag_start ptds
+  JOIN filtered_patients fp ON ptds.Patient_ID = fp.Patient_ID
+),
+
+-- ****************************************************
+-- Step 5: Gather final RX data within 1 year after FIRST_CV_RX_DATE_PATIENT
+-- and still meet conditions: Claim_Type='PD', Source_of_Business!='C', and Rx after FIRST_CV_RX_DATE_PATIENT.
+-- Only keep claims up to FIRST_CV_RX_DATE_PATIENT + 1 year.
+-- ****************************************************
+final_rx_data AS (
+  SELECT
+    r.Patient_ID,
+    r.Service_Date,
+    r.Om_Product_Therapeutic_Class,
+    r.Om_Product_Therapeutic_Sub_Class,
+    r.Om_Product_Brand,
+    r.Source_of_Business,
+    ftl.TA,
+    ftl.FIRST_TA_DIAGNOSIS_DATE,
+    fpt.FIRST_CV_RX_DATE_PATIENT,
+    DATEADD(year, 1, fpt.FIRST_CV_RX_DATE_PATIENT) AS ONE_YEAR_LOOK_FORWARD_DATE
+  FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CV_RX" r
+  JOIN final_ta_list ftl ON r.Patient_ID = ftl.Patient_ID
+  JOIN filtered_patients fpt ON r.Patient_ID = fpt.Patient_ID
+  WHERE r.Claim_Type = 'PD'
+    AND r.Source_of_Business != 'C'
+    AND r.Service_Date >= fpt.FIRST_CV_RX_DATE_PATIENT
+    AND r.Service_Date < DATEADD(year, 1, fpt.FIRST_CV_RX_DATE_PATIENT)
+),
+
+-- ****************************************************
+-- Step 6: Generate lines of therapy for each category (Brand, Sub-Class, Class)
+-- If multiple items on the same date, sort alphabetically and combine with commas.
+-- We'll assume alphabetical sorting by using a sub-select with DISTINCT and ORDER BY.
+-- ****************************************************
+
+-- For alphabetical sorting of multiple items, we can use a window function or a trick:
+-- Snowflake supports LISTAGG(DISTINCT val, ',') WITHIN GROUP (ORDER BY val) in newer versions.
+-- If not supported, we do a sub-select with order by and DISTINCT.
+-- Let's use the LISTAGG with ORDER BY approach (assuming a recent Snowflake version):
+
+-- BRAND lines
+brand_lines AS (
+  SELECT
+    Patient_ID,
+    TA,
+    FIRST_TA_DIAGNOSIS_DATE,
+    FIRST_CV_RX_DATE_PATIENT,
+    ONE_YEAR_LOOK_FORWARD_DATE,
+    Service_Date,
+    LISTAGG(DISTINCT Om_Product_Brand, ', ') WITHIN GROUP (ORDER BY Om_Product_Brand) AS line_brands
+  FROM final_rx_data
+  WHERE Om_Product_Brand IS NOT NULL
+  GROUP BY Patient_ID, TA, FIRST_TA_DIAGNOSIS_DATE, FIRST_CV_RX_DATE_PATIENT, ONE_YEAR_LOOK_FORWARD_DATE, Service_Date
+),
+brand_ranked AS (
+  SELECT
+    bl.*,
+    DENSE_RANK() OVER(PARTITION BY bl.Patient_ID, bl.TA ORDER BY bl.Service_Date) AS line_num
+  FROM brand_lines bl
+),
+brand_pivot AS (
+  SELECT
+    Patient_ID,
+    TA,
+    FIRST_TA_DIAGNOSIS_DATE,
+    FIRST_CV_RX_DATE_PATIENT,
+    ONE_YEAR_LOOK_FORWARD_DATE,
+    'Om_Product_Brand' AS TREATMENT_LEVEL,
+    MAX(CASE WHEN line_num=1 THEN line_brands END) AS LINE_OF_THERAPY_1,
+    MAX(CASE WHEN line_num=2 THEN line_brands END) AS LINE_OF_THERAPY_2,
+    MAX(CASE WHEN line_num=3 THEN line_brands END) AS LINE_OF_THERAPY_3,
+    MAX(CASE WHEN line_num=4 THEN line_brands END) AS LINE_OF_THERAPY_4,
+    MAX(CASE WHEN line_num=5 THEN line_brands END) AS LINE_OF_THERAPY_5
+  FROM brand_ranked
+  GROUP BY Patient_ID, TA, FIRST_TA_DIAGNOSIS_DATE, FIRST_CV_RX_DATE_PATIENT, ONE_YEAR_LOOK_FORWARD_DATE
+),
+
+-- SUB-CLASS lines
+subclass_lines AS (
+  SELECT
+    Patient_ID,
+    TA,
+    FIRST_TA_DIAGNOSIS_DATE,
+    FIRST_CV_RX_DATE_PATIENT,
+    ONE_YEAR_LOOK_FORWARD_DATE,
+    Service_Date,
+    LISTAGG(DISTINCT Om_Product_Therapeutic_Sub_Class, ', ') WITHIN GROUP (ORDER BY Om_Product_Therapeutic_Sub_Class) AS line_sub_classes
+  FROM final_rx_data
+  WHERE Om_Product_Therapeutic_Sub_Class IS NOT NULL
+  GROUP BY Patient_ID, TA, FIRST_TA_DIAGNOSIS_DATE, FIRST_CV_RX_DATE_PATIENT, ONE_YEAR_LOOK_FORWARD_DATE, Service_Date
+),
+subclass_ranked AS (
+  SELECT
+    sl.*,
+    DENSE_RANK() OVER(PARTITION BY sl.Patient_ID, sl.TA ORDER BY sl.Service_Date) AS line_num
+  FROM subclass_lines sl
+),
+subclass_pivot AS (
+  SELECT
+    Patient_ID,
+    TA,
+    FIRST_TA_DIAGNOSIS_DATE,
+    FIRST_CV_RX_DATE_PATIENT,
+    ONE_YEAR_LOOK_FORWARD_DATE,
+    'Om_Product_Therapeutic_Sub_Class' AS TREATMENT_LEVEL,
+    MAX(CASE WHEN line_num=1 THEN line_sub_classes END) AS LINE_OF_THERAPY_1,
+    MAX(CASE WHEN line_num=2 THEN line_sub_classes END) AS LINE_OF_THERAPY_2,
+    MAX(CASE WHEN line_num=3 THEN line_sub_classes END) AS LINE_OF_THERAPY_3,
+    MAX(CASE WHEN line_num=4 THEN line_sub_classes END) AS LINE_OF_THERAPY_4,
+    MAX(CASE WHEN line_num=5 THEN line_sub_classes END) AS LINE_OF_THERAPY_5
+  FROM subclass_ranked
+  GROUP BY Patient_ID, TA, FIRST_TA_DIAGNOSIS_DATE, FIRST_CV_RX_DATE_PATIENT, ONE_YEAR_LOOK_FORWARD_DATE
+),
+
+-- CLASS lines
+class_lines AS (
+  SELECT
+    Patient_ID,
+    TA,
+    FIRST_TA_DIAGNOSIS_DATE,
+    FIRST_CV_RX_DATE_PATIENT,
+    ONE_YEAR_LOOK_FORWARD_DATE,
+    Service_Date,
+    LISTAGG(DISTINCT Om_Product_Therapeutic_Class, ', ') WITHIN GROUP (ORDER BY Om_Product_Therapeutic_Class) AS line_classes
+  FROM final_rx_data
+  WHERE Om_Product_Therapeutic_Class IS NOT NULL
+  GROUP BY Patient_ID, TA, FIRST_TA_DIAGNOSIS_DATE, FIRST_CV_RX_DATE_PATIENT, ONE_YEAR_LOOK_FORWARD_DATE, Service_Date
+),
+class_ranked AS (
+  SELECT
+    cl.*,
+    DENSE_RANK() OVER(PARTITION BY cl.Patient_ID, cl.TA ORDER BY cl.Service_Date) AS line_num
+  FROM class_lines cl
+),
+class_pivot AS (
+  SELECT
+    Patient_ID,
+    TA,
+    FIRST_TA_DIAGNOSIS_DATE,
+    FIRST_CV_RX_DATE_PATIENT,
+    ONE_YEAR_LOOK_FORWARD_DATE,
+    'Om_Product_Therapeutic_Class' AS TREATMENT_LEVEL,
+    MAX(CASE WHEN line_num=1 THEN line_classes END) AS LINE_OF_THERAPY_1,
+    MAX(CASE WHEN line_num=2 THEN line_classes END) AS LINE_OF_THERAPY_2,
+    MAX(CASE WHEN line_num=3 THEN line_classes END) AS LINE_OF_THERAPY_3,
+    MAX(CASE WHEN line_num=4 THEN line_classes END) AS LINE_OF_THERAPY_4,
+    MAX(CASE WHEN line_num=5 THEN line_classes END) AS LINE_OF_THERAPY_5
+  FROM class_ranked
+  GROUP BY Patient_ID, TA, FIRST_TA_DIAGNOSIS_DATE, FIRST_CV_RX_DATE_PATIENT, ONE_YEAR_LOOK_FORWARD_DATE
+)
+
+-- ****************************************************
+-- Step 7: Combine all three treatment levels into one final result
+-- ****************************************************
+SELECT
+  Patient_ID AS PATIENT_ID,
+  FIRST_TA_DIAGNOSIS_DATE AS FIRST_TA_DIAGNOSIS_DATE,
+  FIRST_CV_RX_DATE_PATIENT AS FIRST_CV_RX_DATE,
+  ONE_YEAR_LOOK_FORWARD_DATE AS ONE_YEAR_LOOK_FORWARD_DATE,
+  TA AS THERAPEUTIC_AREA,
+  TREATMENT_LEVEL,
+  LINE_OF_THERAPY_1,
+  LINE_OF_THERAPY_2,
+  LINE_OF_THERAPY_3,
+  LINE_OF_THERAPY_4,
+  LINE_OF_THERAPY_5
+FROM brand_pivot
+
+UNION ALL
+
+SELECT
+  Patient_ID AS PATIENT_ID,
+  FIRST_TA_DIAGNOSIS_DATE AS FIRST_TA_DIAGNOSIS_DATE,
+  FIRST_CV_RX_DATE_PATIENT AS FIRST_CV_RX_DATE,
+  ONE_YEAR_LOOK_FORWARD_DATE AS ONE_YEAR_LOOK_FORWARD_DATE,
+  TA AS THERAPEUTIC_AREA,
+  TREATMENT_LEVEL,
+  LINE_OF_THERAPY_1,
+  LINE_OF_THERAPY_2,
+  LINE_OF_THERAPY_3,
+  LINE_OF_THERAPY_4,
+  LINE_OF_THERAPY_5
+FROM subclass_pivot
+
+UNION ALL
+
+SELECT
+  Patient_ID AS PATIENT_ID,
+  FIRST_TA_DIAGNOSIS_DATE AS FIRST_TA_DIAGNOSIS_DATE,
+  FIRST_CV_RX_DATE_PATIENT AS FIRST_CV_RX_DATE,
+  ONE_YEAR_LOOK_FORWARD_DATE AS ONE_YEAR_LOOK_FORWARD_DATE,
+  TA AS THERAPEUTIC_AREA,
+  TREATMENT_LEVEL,
+  LINE_OF_THERAPY_1,
+  LINE_OF_THERAPY_2,
+  LINE_OF_THERAPY_3,
+  LINE_OF_THERAPY_4,
+  LINE_OF_THERAPY_5
+FROM class_pivot;
 
