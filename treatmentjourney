@@ -675,14 +675,12 @@ Based on this, we need to have some updates to the query:
 3. For the one year look forward, make it a filter, it is means to only include patient with at least 1 year forward window. For example, If we have a patient's first rx date to be yesterday, then it's unnecessary to analyze on this patient for treatment journey.
 
 
-
 ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 144000;
 USE DATABASE "AANALYTICS_PROD";
 USE SCHEMA "WORKSPACE";
 
 -- ****************************************************
--- Set a variable for the latest service date to ensure 1-year window feasibility
--- Here we assume that LATEST_SERVICE_DATE is defined as the maximum service_date in the data.
+-- Set variable for the latest service date for the 1-year look forward feasibility check
 -- ****************************************************
 SET LATEST_SERVICE_DATE = (
     SELECT LAST_DAY(MAX(SERVICE_DATE), 'month') 
@@ -690,8 +688,9 @@ SET LATEST_SERVICE_DATE = (
 );
 
 -- ****************************************************
--- Step 1: Define TA code sets and identify earliest TA diagnosis date per patient-TA
--- Only consider diagnoses on or after 2018-01-01 as per instructions.
+-- Step 1: Define TA code sets
+-- We will determine earliest TA diagnosis date from all claims (no date filter yet).
+-- Later we will exclude TAs that don't meet the >=2018-01-01 condition.
 -- ****************************************************
 WITH ASCVD_CODE AS (
   SELECT DIAG_CD
@@ -730,6 +729,7 @@ ALL_CODES AS (
   SELECT DIAG_CD, 'HFpEF' AS TA FROM HFpEF_CODE
 ),
 
+-- Include all diagnosis claims to find earliest date, no initial date filter here:
 diagnosis_data AS (
   SELECT 
     d.Patient_ID,
@@ -737,7 +737,6 @@ diagnosis_data AS (
     a.TA
   FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CONSOLIDATED_DX" d
   JOIN ALL_CODES a ON d.Diagnosis_Code = a.DIAG_CD
-  WHERE d.Service_Date >= DATE '2018-01-01' -- Only include diagnoses after 2018-01-01
 ),
 
 patient_ta_diag_start AS (
@@ -750,20 +749,10 @@ patient_ta_diag_start AS (
 ),
 
 -- ****************************************************
--- Step 2: Earliest Rx date at patient level (not per TA)
--- Conditions:
---   - Claim_Type='PD'
---   - Source_of_Business!='C'
---   - Rx date must be > earliest TA diagnosis date and within 90 days of that earliest TA diag date for at least one TA.
--- We will find all Rx claims that meet these conditions for any TA, then pick the earliest Rx date per patient.
+-- Step 2: Find earliest Rx date at the patient level (not TA level),
+-- that meets conditions: Claim_Type='PD', Source_of_Business!='C',
+-- Rx date > TA diag date and within 90 days for at least one TA.
 -- ****************************************************
--- First, gather all (patient, TA) pairs with valid earliest TA diag dates:
-valid_ta AS (
-  SELECT * 
-  FROM patient_ta_diag_start
-),
-
--- Get all Rx that meets conditions for ANY TA:
 rx_candidates AS (
   SELECT DISTINCT
     r.Patient_ID,
@@ -772,17 +761,16 @@ rx_candidates AS (
     r.Om_Product_Therapeutic_Sub_Class,
     r.Om_Product_Brand,
     r.Source_of_Business,
-    vta.TA,
-    vta.FIRST_TA_DIAGNOSIS_DATE
+    ptds.TA,
+    ptds.FIRST_TA_DIAGNOSIS_DATE
   FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CV_RX" r
-  JOIN valid_ta vta ON r.Patient_ID = vta.Patient_ID
+  JOIN patient_ta_diag_start ptds ON r.Patient_ID = ptds.Patient_ID
   WHERE r.Claim_Type = 'PD'
     AND r.Source_of_Business != 'C'
-    AND r.Service_Date > vta.FIRST_TA_DIAGNOSIS_DATE
-    AND DATEDIFF('day', vta.FIRST_TA_DIAGNOSIS_DATE, r.Service_Date) <= 90
+    AND r.Service_Date > ptds.FIRST_TA_DIAGNOSIS_DATE
+    AND DATEDIFF('day', ptds.FIRST_TA_DIAGNOSIS_DATE, r.Service_Date) <= 90
 ),
 
--- Earliest Rx date per patient that satisfies any TA condition:
 patient_earliest_rx AS (
   SELECT
     Patient_ID,
@@ -793,8 +781,8 @@ patient_earliest_rx AS (
 
 -- ****************************************************
 -- Step 3: 1-year look forward feasibility
--- Only include patients whose FIRST_CV_RX_DATE_PATIENT <= LATEST_SERVICE_DATE - 1 year
--- This ensures we have a full 1-year window of data after their earliest Rx date.
+-- Only keep patients whose FIRST_CV_RX_DATE_PATIENT <= (LATEST_SERVICE_DATE - 1 year)
+-- so we have at least one full year of data post Rx.
 -- ****************************************************
 filtered_patients AS (
   SELECT
@@ -805,10 +793,9 @@ filtered_patients AS (
 ),
 
 -- ****************************************************
--- Step 4: Now filter the TA list to only those patients who are in filtered_patients
--- and keep only those TAs where FIRST_TA_DIAGNOSIS_DATE >= 2018-01-01 (already ensured)
--- Actually, we've ensured that in the initial diagnosis_data step. All are after 2018-01-01.
--- Just ensure the patient is in filtered_patients.
+-- Step 4: Now include only those TAs for patients in filtered_patients
+-- BUT we must ensure that FIRST_TA_DIAGNOSIS_DATE >= '2018-01-01' for that TA.
+-- If a TA's earliest diagnosis date is before 2018, exclude that TA for that patient.
 -- ****************************************************
 final_ta_list AS (
   SELECT
@@ -817,12 +804,13 @@ final_ta_list AS (
     ptds.FIRST_TA_DIAGNOSIS_DATE
   FROM patient_ta_diag_start ptds
   JOIN filtered_patients fp ON ptds.Patient_ID = fp.Patient_ID
+  WHERE ptds.FIRST_TA_DIAGNOSIS_DATE >= DATE '2018-01-01'
 ),
 
 -- ****************************************************
--- Step 5: Gather final RX data within 1 year after FIRST_CV_RX_DATE_PATIENT
--- and still meet conditions: Claim_Type='PD', Source_of_Business!='C', and Rx after FIRST_CV_RX_DATE_PATIENT.
--- Only keep claims up to FIRST_CV_RX_DATE_PATIENT + 1 year.
+-- Step 5: Gather final Rx data within 1 year after FIRST_CV_RX_DATE_PATIENT
+-- and meet conditions: Claim_Type='PD', Source_of_Business!='C', Rx date >= FIRST_CV_RX_DATE_PATIENT.
+-- Only keep claims < FIRST_CV_RX_DATE_PATIENT + 1 year.
 -- ****************************************************
 final_rx_data AS (
   SELECT
@@ -834,27 +822,22 @@ final_rx_data AS (
     r.Source_of_Business,
     ftl.TA,
     ftl.FIRST_TA_DIAGNOSIS_DATE,
-    fpt.FIRST_CV_RX_DATE_PATIENT,
-    DATEADD(year, 1, fpt.FIRST_CV_RX_DATE_PATIENT) AS ONE_YEAR_LOOK_FORWARD_DATE
+    fp.FIRST_CV_RX_DATE_PATIENT,
+    DATEADD(year, 1, fp.FIRST_CV_RX_DATE_PATIENT) AS ONE_YEAR_LOOK_FORWARD_DATE
   FROM "LAAD_PROD"."RPT_LAAD"."PTAB_F_LAAD_CV_RX" r
   JOIN final_ta_list ftl ON r.Patient_ID = ftl.Patient_ID
-  JOIN filtered_patients fpt ON r.Patient_ID = fpt.Patient_ID
+  JOIN filtered_patients fp ON r.Patient_ID = fp.Patient_ID
   WHERE r.Claim_Type = 'PD'
     AND r.Source_of_Business != 'C'
-    AND r.Service_Date >= fpt.FIRST_CV_RX_DATE_PATIENT
-    AND r.Service_Date < DATEADD(year, 1, fpt.FIRST_CV_RX_DATE_PATIENT)
+    AND r.Service_Date >= fp.FIRST_CV_RX_DATE_PATIENT
+    AND r.Service_Date < DATEADD(year, 1, fp.FIRST_CV_RX_DATE_PATIENT)
 ),
 
 -- ****************************************************
 -- Step 6: Generate lines of therapy for each category (Brand, Sub-Class, Class)
--- If multiple items on the same date, sort alphabetically and combine with commas.
--- We'll assume alphabetical sorting by using a sub-select with DISTINCT and ORDER BY.
+-- If multiple items on the same date, sort alphabetically.
+-- We use LISTAGG with ORDER BY for alphabetical sorting.
 -- ****************************************************
-
--- For alphabetical sorting of multiple items, we can use a window function or a trick:
--- Snowflake supports LISTAGG(DISTINCT val, ',') WITHIN GROUP (ORDER BY val) in newer versions.
--- If not supported, we do a sub-select with order by and DISTINCT.
--- Let's use the LISTAGG with ORDER BY approach (assuming a recent Snowflake version):
 
 -- BRAND lines
 brand_lines AS (
@@ -968,7 +951,7 @@ class_pivot AS (
 )
 
 -- ****************************************************
--- Step 7: Combine all three treatment levels into one final result
+-- Step 7: Combine all three treatment levels into one final result set
 -- ****************************************************
 SELECT
   Patient_ID AS PATIENT_ID,
