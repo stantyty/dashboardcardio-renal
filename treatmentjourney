@@ -669,6 +669,10 @@ FROM class_pivot;
 
 
 
+Based on this, we need to have some updates to the query: 
+1. we want the frist rx date based on patient's level only, don't based on TA level anymore. For First DX time, it remains unchanged on patient and TA Level. 
+2. we only include the patients that patient's first TA dx is later than 2018-1-1(here, its group by patient and TA). 
+3. For the one year look forward, make it a filter, it is means to only include patient with at least 1 year forward window. For example, If we have a patient's first rx date to be yesterday, then it's unnecessary to analyze on this patient for treatment journey.
 
 
 
